@@ -563,19 +563,41 @@ Item {
     Qt.callLater(function() { root.startSearch() })
   }
 
+  function isExactSearchMatch(item, query) {
+    var needle = root.cleanField(query).trim().toLocaleLowerCase()
+    if (!needle) return false
+
+    function equals(value) {
+      return root.cleanField(value).trim().toLocaleLowerCase() === needle
+    }
+
+    if (equals(item.title) || equals(item.bookmarkName) || equals(item.createName)) return true
+    if (equals(item.path)) return true
+
+    var pathWithoutExtension = root.cleanField(item.path).trim().replace(/\.[^/.]+$/, "")
+    if (equals(pathWithoutExtension)) return true
+
+    var aliases = String(item.aliases || "").split(" · ")
+    for (var i = 0; i < aliases.length; i++) {
+      if (equals(aliases[i])) return true
+    }
+    return false
+  }
+
   function applySearchOutput(revision, query, output) {
     if (!root.opened || revision !== root.searchRevision || query !== root.filterText) return
 
-    var nextRows = []
+    var exactRows = []
+    var regularRows = []
     var lines = String(output || "").split("\n")
-    for (var i = 0; i < lines.length && nextRows.length < 50; i++) {
+    for (var i = 0; i < lines.length; i++) {
       if (!lines[i]) continue
       var separator = lines[i].indexOf(root.fieldSeparator)
       var indexText = separator >= 0 ? lines[i].substring(0, separator) : lines[i]
       var itemIndex = Number(indexText)
       if (!Number.isInteger(itemIndex) || itemIndex < 0 || itemIndex >= root.searchItems.length) continue
       var item = root.searchItems[itemIndex]
-      nextRows.push({
+      var row = {
         notePath: item.path,
         noteTitle: item.title,
         aliases: item.aliases,
@@ -583,8 +605,13 @@ Item {
         isBookmark: item.isBookmark,
         createName: item.createName,
         fileIcon: item.fileIcon
-      })
+      }
+      if (root.isExactSearchMatch(item, query)) exactRows.push(row)
+      else regularRows.push(row)
     }
+
+    var nextRows = exactRows.concat(regularRows)
+    if (nextRows.length > 50) nextRows = nextRows.slice(0, 50)
 
     if (nextRows.length === 0) {
       // Keep the previous result set visible until the process has fully
