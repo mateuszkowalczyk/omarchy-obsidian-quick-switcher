@@ -9,7 +9,7 @@ want.
 - Create missing linked notes or a new note from any query
 - Open files in Obsidian, launching Obsidian first when needed
 
-![Obsidian Quick Switcher for Omarchy](assets/quick-switcher.jpg)
+![Obsidian Quick Switcher for Omarchy](preview.png)
 
 ## Requirements
 
