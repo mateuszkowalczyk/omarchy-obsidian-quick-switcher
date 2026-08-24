@@ -45,6 +45,7 @@ Item {
   property color selectedBackground: Color.menu.selectedBackground
   property color selectedText: Color.menu.selectedText
   property color selectedBorder: Color.menu.selectedBorder
+  property color createActionColor: Color.accent
   property var selectedBorderSpec: Border.surfaceSpec("menu", "selected-border", selectedBorder, 0)
   readonly property real rowReservedBorderLeft: Border.left(selectedBorderSpec)
   readonly property real rowReservedBorderRight: Border.right(selectedBorderSpec)
@@ -380,10 +381,17 @@ Item {
           && root.activeSearchQuery === root.filterText) {
         var emptyModel = root.activeResultModel === displayModel ? stagingModel : displayModel
         emptyModel.clear()
+        emptyModel.append({
+          notePath: "",
+          noteTitle: root.filterText,
+          aliases: "",
+          fileIcon: "󰐖"
+        })
         root.activeResultModel = emptyModel
         root.emptySearchResult = false
         root.selectedIndex = 0
-        root.cursorActive = false
+        root.cursorActive = true
+        Qt.callLater(function() { resultList.positionViewAtIndex(0, ListView.Beginning) })
       }
       return
     }
@@ -455,9 +463,22 @@ Item {
   function activateIndex(index) {
     if (index < 0 || index >= root.activeResultModel.count) return
     var row = root.activeResultModel.get(index)
-    if (!row.notePath) return
+    if (!row.notePath) {
+      root.createNote()
+      return
+    }
 
     var args = ["obsidian", "open", "path=" + row.notePath]
+    if (root.vault) args.push("vault=" + root.vault)
+    root.dismiss()
+    Quickshell.execDetached(args)
+  }
+
+  function createNote() {
+    var name = root.filterText.trim()
+    if (!name) return
+
+    var args = ["obsidian", "create", "name=" + name, "open"]
     if (root.vault) args.push("vault=" + root.vault)
     root.dismiss()
     Quickshell.execDetached(args)
@@ -660,6 +681,10 @@ Item {
           } else if (event.key === Qt.Key_PageDown) {
             root.selectPage(1)
             event.accepted = true
+          } else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                     && (event.modifiers & Qt.ShiftModifier)) {
+            root.createNote()
+            event.accepted = true
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             if (root.cursorActive) root.activateIndex(root.selectedIndex)
             event.accepted = true
@@ -718,6 +743,7 @@ Item {
               required property string aliases
               required property string fileIcon
 
+              readonly property bool isCreateRow: !row.notePath
               readonly property bool hasCursor: root.cursorActive && row.index === root.selectedIndex
               width: ListView.view.width
               height: root.rowHeight
@@ -727,7 +753,7 @@ Item {
 
               Text {
                 id: iconText
-                text: row.fileIcon
+                text: row.isCreateRow ? "󰐖" : row.fileIcon
                 color: row.hasCursor ? root.selectedText : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.iconLarge
@@ -759,12 +785,17 @@ Item {
 
                 Text {
                   width: parent.width
-                  text: root.highlighted(row.notePath + (row.aliases ? "  ·  " + row.aliases : ""))
-                  textFormat: Text.RichText
-                  color: row.hasCursor ? root.selectedText : root.foreground
-                  opacity: 0.62
+                  text: row.isCreateRow
+                    ? "↵ to create"
+                    : root.highlighted(row.notePath + (row.aliases ? "  ·  " + row.aliases : ""))
+                  textFormat: row.isCreateRow ? Text.PlainText : Text.RichText
+                  color: row.isCreateRow
+                    ? (row.hasCursor ? root.selectedText : root.createActionColor)
+                    : (row.hasCursor ? root.selectedText : root.foreground)
+                  opacity: row.isCreateRow ? 1 : 0.62
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
+                  horizontalAlignment: Text.AlignLeft
                   elide: Text.ElideRight
                 }
               }
