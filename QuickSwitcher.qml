@@ -20,6 +20,7 @@ Item {
   property bool stoppingProcesses: false
   property bool searchQueued: false
   property bool searchBusy: false
+  property int sessionSerial: 0
   property bool emptySearchResult: false
   property bool recentsLoaded: false
   property string filterText: ""
@@ -64,6 +65,7 @@ Item {
   property int rowHeight: Math.max(Style.space(58), Style.font.body + Style.font.caption + Style.spacing.rowPaddingX * 2)
   property int rowSpacing: Style.spacing.xs
   property int rowPeek: Math.round(rowHeight * 0.55)
+  readonly property int searchTimeoutMs: 8000
   property int cardWidth: Math.min(Style.space(620), panel.width - Style.gapsOut * 2)
   property int resultHeight: {
     if (!showResults) return 0
@@ -148,12 +150,16 @@ Item {
   }
 
   function clearSession() {
+    root.sessionSerial += 1
+    searchTimeout.stop()
     root.filesLoaded = false
     root.aliasesLoaded = false
     root.unresolvedLoaded = false
     root.cursorActive = false
     root.searchQueued = false
     root.searchBusy = false
+    searchProc.timedOut = false
+    searchProc.collected = ""
     root.emptySearchResult = false
     root.filterText = ""
     root.filesOutput = ""
@@ -180,12 +186,15 @@ Item {
 
   function stopProcesses() {
     root.stoppingProcesses = true
+    searchTimeout.stop()
     filesProc.running = false
     aliasesProc.running = false
     bookmarksProc.running = false
     unresolvedProc.running = false
     recentProc.running = false
     searchProc.running = false
+    searchProc.timedOut = false
+    searchProc.collected = ""
     root.searchBusy = false
     root.stoppingProcesses = false
   }
@@ -531,13 +540,14 @@ Item {
     searchProc.revision = root.searchRevision
     searchProc.query = root.filterText
     searchProc.searchInput = root.fzfInput
-    searchProc.exited = false
-    searchProc.outputFinished = false
+    searchProc.sessionSerial = root.sessionSerial
+    searchProc.collected = ""
+    searchProc.timedOut = false
+    searchTimeout.restart()
     searchProc.running = true
   }
 
   function finishSearchProcess() {
-    if (!searchProc.exited || !searchProc.outputFinished) return
     root.searchBusy = false
     if (!root.searchQueued || !root.filterText) {
       root.searchQueued = false
@@ -810,27 +820,66 @@ Item {
     property int revision: 0
     property string query: ""
     property string searchInput: ""
-    property bool exited: false
-    property bool outputFinished: false
+    property int sessionSerial: 0
+    property string collected: ""
+    property bool timedOut: false
 
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.applySearchOutput(searchProc.revision, searchProc.query, text)
-        searchProc.outputFinished = true
-        root.finishSearchProcess()
-      }
+    stdout: SplitParser {
+      onRead: function(data) { searchProc.collected += data + "\n" }
     }
     stderr: StdioCollector { id: searchErrorCollector; waitForEnd: true }
     command: ["bash", "-c", root.fzfCommand]
     onStarted: write(searchProc.query + "\n" + searchProc.searchInput + root.inputSentinel + "\n")
     onExited: function(exitCode) {
-      searchProc.exited = true
+      root.searchTimeout.stop()
+      if (!root.opened || root.stoppingProcesses || searchProc.sessionSerial !== root.sessionSerial) return
+
+      if (searchProc.timedOut) {
+        searchProc.timedOut = false
+        root.searchBusy = false
+        if (root.filterText) {
+          root.searchQueued = false
+          Qt.callLater(function() { root.startSearch() })
+        } else {
+          root.searchQueued = false
+        }
+        return
+      }
+
+      var completedRevision = searchProc.revision
+      var completedQuery = searchProc.query
+      var completedOutput = searchProc.collected
+      root.applySearchOutput(completedRevision, completedQuery, completedOutput)
       root.finishSearchProcess()
-      if (root.opened && !root.stoppingProcesses
-          && exitCode !== 0 && exitCode !== 1
-          && searchProc.revision === root.searchRevision) {
+      if (exitCode !== 0 && exitCode !== 1
+          && completedRevision === root.searchRevision) {
         root.errorText = String(searchErrorCollector.text || "").trim() || "fzf search failed"
+      }
+    }
+  }
+
+  Timer {
+    id: searchTimeout
+    interval: root.searchTimeoutMs
+    repeat: false
+    onTriggered: {
+      if (!root.searchBusy) return
+
+      searchProc.timedOut = true
+      if (searchProc.running) {
+        searchProc.running = false
+        return
+      }
+
+      // A Process can fail before it reaches onStarted. Recover even when
+      // that failure does not produce an onExited callback.
+      searchProc.timedOut = false
+      root.searchBusy = false
+      if (root.filterText) {
+        root.searchQueued = false
+        Qt.callLater(function() { root.startSearch() })
+      } else {
+        root.searchQueued = false
       }
     }
   }
