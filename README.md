@@ -20,7 +20,7 @@ want.
 ## Install
 
 ```bash
-omarchy plugin install https://github.com/mateuszkowalczyk/omarchy-obsidian-quick-switcher --enable
+omarchy plugin add https://github.com/mateuszkowalczyk/omarchy-obsidian-quick-switcher --enable
 ```
 
 ## Binding
@@ -48,6 +48,13 @@ The switcher launches Obsidian automatically if it is not already running.
 | `Enter` | Open the selected file |
 | `Shift` + `Enter` | Create and open a new note using the query |
 | `Esc` | Clear the query, then close the panel |
+
+
+## Remove
+
+```bash
+omarchy plugin remove mateuszkowalczyk.obsidian-quick-switcher
+```
 
 ## License
 
