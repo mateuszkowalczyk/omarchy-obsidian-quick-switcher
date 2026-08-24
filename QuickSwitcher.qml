@@ -476,7 +476,7 @@ Item {
 
   function iconForPath(path) {
     var lower = String(path || "").toLocaleLowerCase()
-    if (/\.md$/.test(lower)) return "󰈔"
+    if (/\.md$/.test(lower)) return ""
     if (/\.html?$/.test(lower)) return "󰌝"
     if (/\.css$/.test(lower)) return "󰌜"
     if (/\.(js|mjs|cjs|ts|tsx)$/.test(lower)) return "󰌞"
@@ -982,17 +982,17 @@ Item {
                 width: Style.space(36)
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
-                anchors.left: parent.left
-                anchors.leftMargin: root.rowReservedBorderLeft + Style.space(8)
+                anchors.right: parent.right
+                anchors.rightMargin: root.rowReservedBorderRight + Style.space(8)
                 anchors.verticalCenter: parent.verticalCenter
               }
 
               Column {
-                anchors.left: iconText.right
-                anchors.right: parent.right
+                anchors.left: parent.left
+                anchors.right: iconText.left
                 anchors.verticalCenter: parent.verticalCenter
-                anchors.leftMargin: Style.spacing.sm
-                anchors.rightMargin: root.rowReservedBorderRight + Style.space(12)
+                anchors.leftMargin: root.rowReservedBorderLeft + Style.space(8)
+                anchors.rightMargin: Style.spacing.sm
                 spacing: Style.space(3)
 
                 Text {
