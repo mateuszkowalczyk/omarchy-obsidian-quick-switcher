@@ -36,13 +36,16 @@ Item {
   property int searchRevision: 0
   property int activeSearchRevision: 0
   property int selectedIndex: 0
-  property var notes: []
+  property var notesByPath: ({})
+  property var filePaths: []
+  property var existingPathIndex: ({})
   property var searchItems: []
   property var exactSearchIndex: ({})
   property var indexWorkers: []
   property var activeResultModel: displayModel
 
   readonly property bool indexReady: indexBuilt
+  readonly property bool recentsReady: recentsLoaded && filesLoaded
   readonly property bool showResults: opened
 
   property color background: Color.menu.background
@@ -177,7 +180,9 @@ Item {
     root.searchRevision = 0
     root.activeSearchRevision = 0
     root.selectedIndex = 0
-    root.notes = []
+    root.notesByPath = ({})
+    root.filePaths = []
+    root.existingPathIndex = ({})
     root.searchItems = []
     root.exactSearchIndex = ({})
     root.indexWorkers = []
@@ -298,10 +303,28 @@ Item {
       .replace(/\x1e/g, " ")
   }
 
+  function pathIndexKey(path) {
+    return "$" + root.cleanField(path).trim()
+  }
+
   function finishFiles(output) {
     if (!root.opened || root.filesLoaded) return
     root.filesOutput = String(output || "")
+
+    var paths = []
+    var pathIndex = ({})
+    var lines = root.filesOutput.split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var path = root.cleanField(lines[i].trim())
+      var key = root.pathIndexKey(path)
+      if (!path || pathIndex[key]) continue
+      pathIndex[key] = true
+      paths.push(path)
+    }
+    root.filePaths = paths
+    root.existingPathIndex = pathIndex
     root.filesLoaded = true
+    if (root.recentsLoaded) root.buildRecentModel()
     root.maybeBuildIndex()
   }
 
@@ -334,23 +357,23 @@ Item {
   }
 
   function buildRecentModel() {
-    if (!root.recentsLoaded) return
+    if (!root.recentsReady) return
 
     var rows = []
     var seen = ({})
     var recentLines = root.recentsOutput.split("\n")
     for (var i = 0; i < recentLines.length; i++) {
       var path = root.cleanField(recentLines[i].trim())
-      if (!path || seen[path]) continue
-      seen[path] = true
+      var pathKey = root.pathIndexKey(path)
+      if (!path || !root.existingPathIndex[pathKey] || seen[pathKey]) continue
+      seen[pathKey] = true
 
       var title = root.titleForPath(path)
       var aliases = ""
-      for (var j = 0; j < root.notes.length; j++) {
-        if (root.notes[j].path !== path) continue
-        title = root.notes[j].title
-        aliases = root.notes[j].aliases.join(" · ")
-        break
+      var note = root.notesByPath[pathKey]
+      if (note) {
+        title = note.title
+        aliases = note.aliases.join(" · ")
       }
       rows.push({
         notePath: path,
@@ -445,9 +468,8 @@ Item {
 
     var byPath = ({})
     var order = []
-    var fileLines = root.filesOutput.split("\n")
-    for (var i = 0; i < fileLines.length; i++) {
-      var path = root.cleanField(fileLines[i].trim())
+    for (var i = 0; i < root.filePaths.length; i++) {
+      var path = root.filePaths[i]
       if (!path || byPath[path]) continue
       byPath[path] = { path: path, title: root.titleForPath(path), aliases: [] }
       order.push(path)
@@ -493,12 +515,12 @@ Item {
       unresolvedItems = []
     }
 
-    var nextNotes = []
+    var notesByPath = ({})
     var searchItems = []
     var rows = []
     for (var k = 0; k < order.length; k++) {
       var note = byPath[order[k]]
-      nextNotes.push(note)
+      notesByPath[root.pathIndexKey(note.path)] = note
 
       root.appendSearchItem(searchItems, rows, {
         path: note.path,
@@ -562,7 +584,7 @@ Item {
       })
     }
 
-    root.notes = nextNotes
+    root.notesByPath = notesByPath
     root.searchItems = searchItems
     root.exactSearchIndex = root.buildExactSearchIndex(searchItems)
     root.fzfInput = rows.join("\n") + (rows.length ? "\n" : "")
@@ -1286,7 +1308,7 @@ Item {
             visible: !root.activeResultModel || root.activeResultModel.count === 0
             text: root.filterText
               ? (root.errorText || (!root.indexReady ? "Loading files, aliases, bookmarks, and links…" : "No matching files"))
-              : (!root.recentsLoaded ? "Loading recent notes…" : "No recent notes")
+              : (!root.recentsReady ? "Loading recent notes…" : "No recent notes")
             color: root.foreground
             opacity: 0.58
             font.family: root.fontFamily
