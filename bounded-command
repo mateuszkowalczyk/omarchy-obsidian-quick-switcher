@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+
+# Run a command while ensuring neither output stream can grow without bound.
+# The extra byte distinguishes an exact fit from an overflow.
+
+if (( $# < 5 )) || [[ ! $1 =~ ^[1-9][0-9]*$ ]] || [[ ! $2 =~ ^[1-9][0-9]*$ ]]; then
+  echo "usage: bounded-command STDOUT_BYTES STDERR_BYTES LABEL COMMAND [ARG ...]" >&2
+  exit 64
+fi
+
+stdout_limit=$1
+stderr_limit=$2
+label=$3
+shift 3
+
+capture_dir=$(mktemp -d /tmp/obsidian-quick-switcher.XXXXXX) || exit 1
+stdout_pipe=$capture_dir/stdout.pipe
+stderr_pipe=$capture_dir/stderr.pipe
+stdout_file=$capture_dir/stdout
+stderr_file=$capture_dir/stderr
+stdout_reader=
+stderr_reader=
+command_pid=
+
+cleanup() {
+  [[ -n $command_pid ]] && kill "$command_pid" 2>/dev/null || true
+  [[ -n $stdout_reader ]] && kill "$stdout_reader" 2>/dev/null || true
+  [[ -n $stderr_reader ]] && kill "$stderr_reader" 2>/dev/null || true
+  rm -f -- "$stdout_pipe" "$stderr_pipe" "$stdout_file" "$stderr_file"
+  rmdir -- "$capture_dir" 2>/dev/null || true
+}
+handle_signal() {
+  exit 143
+}
+trap cleanup EXIT
+trap handle_signal HUP INT TERM
+
+mkfifo "$stdout_pipe" "$stderr_pipe" || exit 1
+head -c "$((stdout_limit + 1))" <"$stdout_pipe" >"$stdout_file" &
+stdout_reader=$!
+head -c "$((stderr_limit + 1))" <"$stderr_pipe" >"$stderr_file" &
+stderr_reader=$!
+
+"$@" <&0 >"$stdout_pipe" 2>"$stderr_pipe" &
+command_pid=$!
+wait "$command_pid"
+command_status=$?
+command_pid=
+wait "$stdout_reader" 2>/dev/null || true
+wait "$stderr_reader" 2>/dev/null || true
+stdout_reader=
+stderr_reader=
+
+stdout_size=$(wc -c <"$stdout_file")
+stderr_size=$(wc -c <"$stderr_file")
+
+if (( stdout_size > stdout_limit )); then
+  echo "Obsidian $label output exceeds the supported $stdout_limit-byte limit" >&2
+  exit 74
+fi
+if (( stderr_size > stderr_limit )); then
+  echo "Obsidian $label error output exceeds the supported $stderr_limit-byte limit" >&2
+  exit 74
+fi
+
+cat "$stdout_file"
+cat "$stderr_file" >&2
+exit "$command_status"

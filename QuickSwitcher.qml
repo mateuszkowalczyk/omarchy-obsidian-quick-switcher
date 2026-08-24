@@ -17,6 +17,7 @@ Item {
   property bool bookmarksLoaded: false
   property bool unresolvedLoaded: false
   property bool indexBuilt: false
+  property bool indexFailed: false
   property bool cursorActive: false
   property var activeSearchWorker: null
   property int sessionSerial: 0
@@ -75,6 +76,25 @@ Item {
   property int rowSpacing: Style.spacing.xs
   property int rowPeek: Math.round(rowHeight * 0.55)
   readonly property int searchTimeoutMs: 3000
+  readonly property int maxFiles: 50000
+  readonly property int maxAliases: 100000
+  readonly property int maxAliasesPerFile: 64
+  readonly property int maxBookmarks: 10000
+  readonly property int maxUnresolved: 50000
+  readonly property int maxRecents: 1000
+  readonly property int maxSearchItems: 110000
+  readonly property int maxPathBytes: 4096
+  readonly property int maxLabelBytes: 1024
+  readonly property int maxFzfInputBytes: 32 * 1024 * 1024
+  readonly property int maxFzfOutputBytes: 8 * 1024 * 1024
+  readonly property int maxFilesOutputBytes: 8 * 1024 * 1024
+  readonly property int maxAliasesOutputBytes: 16 * 1024 * 1024
+  readonly property int maxBookmarksOutputBytes: 4 * 1024 * 1024
+  readonly property int maxUnresolvedOutputBytes: 16 * 1024 * 1024
+  readonly property int maxRecentsOutputBytes: 1024 * 1024
+  readonly property int maxStderrBytes: 64 * 1024
+  readonly property string boundedCommandPath:
+    decodeURIComponent(Qt.resolvedUrl("bounded-command").toString().replace(/^file:\/\//, ""))
   property int cardWidth: Math.min(Style.space(620), panel.width - Style.gapsOut * 2)
   property int resultHeight: {
     if (!showResults) return 0
@@ -94,7 +114,7 @@ Item {
   readonly property string obsidianReadyProbe:
     "if ! command -v obsidian >/dev/null 2>&1; then "
     + "echo 'Obsidian CLI is not available' >&2; exit 127; fi; "
-    + "probe_output=$(timeout 1 obsidian files total \"${vault_args[@]}\" 2>&1); "
+    + "probe_output=$(timeout 1 obsidian files total \"${vault_args[@]}\" 2>&1 | head -c 4097); "
     + "count=$(printf '%s' \"$probe_output\" | tr -d '[:space:]'); "
     + "if printf '%s' \"$probe_output\" | grep -qi 'command line interface is not enabled'; then "
     + "echo 'Obsidian CLI is not enabled' >&2; exit 2; fi; "
@@ -170,6 +190,7 @@ Item {
     root.aliasesLoaded = false
     root.unresolvedLoaded = false
     root.indexBuilt = false
+    root.indexFailed = false
     root.cursorActive = false
     root.activeSearchWorker = null
     root.emptySearchResult = false
@@ -245,18 +266,23 @@ Item {
     // Poll a numeric file count before the real scans. Each probe is bounded
     // because a startup race must not turn a scan process into the app. Empty
     // vaults remain valid because zero is a numeric readiness response.
-    root.startIndexWorker("files", ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "files"])
-    root.startIndexWorker("aliases", ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "aliases"])
-    root.startIndexWorker("unresolved", ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "unresolved"])
-    root.startIndexWorker("recents", ["bash", "-c", root.obsidianRecentsCommand, "obsidian-quick-switcher", root.vault])
-    root.startIndexWorker("bookmarks", ["bash", "-c", root.obsidianBookmarksCommand, "obsidian-quick-switcher", root.vault])
+    root.startIndexWorker("files", root.maxFilesOutputBytes,
+      ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "files"])
+    root.startIndexWorker("aliases", root.maxAliasesOutputBytes,
+      ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "aliases"])
+    root.startIndexWorker("unresolved", root.maxUnresolvedOutputBytes,
+      ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "unresolved"])
+    root.startIndexWorker("recents", root.maxRecentsOutputBytes,
+      ["bash", "-c", root.obsidianRecentsCommand, "obsidian-quick-switcher", root.vault])
+    root.startIndexWorker("bookmarks", root.maxBookmarksOutputBytes,
+      ["bash", "-c", root.obsidianBookmarksCommand, "obsidian-quick-switcher", root.vault])
   }
 
-  function startIndexWorker(kind, command) {
+  function startIndexWorker(kind, outputLimit, command) {
     var worker = indexWorkerComponent.createObject(root, {
       kind: kind,
       sessionSerial: root.sessionSerial,
-      command: command
+      command: [root.boundedCommandPath, String(outputLimit), String(root.maxStderrBytes), kind].concat(command)
     })
     if (!worker) {
       root.finishIndexKind(kind, "", "Unable to start Obsidian CLI")
@@ -283,6 +309,7 @@ Item {
       var error = worker.exitCode === 0 ? "" : (worker.errorOutput || "Obsidian CLI command failed")
       if (worker.exitCode === 2) error = "Obsidian CLI is not enabled"
       if (worker.exitCode === 127) error = "Obsidian CLI is not available"
+      if (worker.exitCode === 74) root.failIndex(error)
       root.finishIndexKind(worker.kind, output, error)
     }
     Qt.callLater(function() { worker.destroy() })
@@ -319,24 +346,79 @@ Item {
       .replace(/\x1e/g, " ")
   }
 
+  function utf8Bytes(value) {
+    try {
+      return encodeURIComponent(String(value || ""))
+        .replace(/%[0-9A-Fa-f]{2}/g, "x").length
+    } catch (e) {
+      return Number.MAX_SAFE_INTEGER
+    }
+  }
+
+  function failIndex(message) {
+    if (root.indexFailed) return false
+    root.indexFailed = true
+    root.errorText = String(message || "Vault index exceeds a supported resource limit")
+    root.filesOutput = ""
+    root.aliasesOutput = ""
+    root.bookmarksOutput = ""
+    root.unresolvedOutput = ""
+    root.recentsOutput = ""
+    root.filePaths = []
+    root.existingPathIndex = ({})
+    root.notesByPath = ({})
+    root.searchItems = []
+    root.exactSearchIndex = ({})
+    root.fzfInput = ""
+    root.cursorActive = false
+    displayModel.clear()
+    stagingModel.clear()
+    recentModel.clear()
+    return false
+  }
+
+  function checkField(value, byteLimit, label) {
+    if (root.utf8Bytes(value) <= byteLimit) return true
+    return root.failIndex("Vault index exceeds the supported " + label + " size limit")
+  }
+
   function pathIndexKey(path) {
     return "$" + root.cleanField(path).trim()
   }
 
   function finishFiles(output) {
     if (!root.opened || root.filesLoaded) return
+    if (root.indexFailed) {
+      root.filesLoaded = true
+      return
+    }
     root.filesOutput = String(output || "")
 
     var paths = []
     var pathIndex = ({})
-    var lines = root.filesOutput.split("\n")
-    for (var i = 0; i < lines.length; i++) {
-      var path = root.cleanField(lines[i].trim())
+    var start = 0
+    var records = 0
+    while (start < root.filesOutput.length) {
+      var end = root.filesOutput.indexOf("\n", start)
+      if (end < 0) end = root.filesOutput.length
+      var path = root.cleanField(root.filesOutput.substring(start, end).trim())
+      start = end + 1
+      records += 1
+      if (records > root.maxFiles) {
+        root.failIndex("Vault index exceeds the supported file limit (" + root.maxFiles + ")")
+        break
+      }
+      if (!root.checkField(path, root.maxPathBytes, "path")) break
       var key = root.pathIndexKey(path)
       if (!path || pathIndex[key]) continue
       pathIndex[key] = true
       paths.push(path)
     }
+    if (root.indexFailed) {
+      root.filesLoaded = true
+      return
+    }
+    root.filesOutput = ""
     root.filePaths = paths
     root.existingPathIndex = pathIndex
     root.filesLoaded = true
@@ -346,6 +428,10 @@ Item {
 
   function finishAliases(output) {
     if (!root.opened || root.aliasesLoaded) return
+    if (root.indexFailed) {
+      root.aliasesLoaded = true
+      return
+    }
     root.aliasesOutput = String(output || "")
     root.aliasesLoaded = true
     root.maybeBuildIndex()
@@ -353,6 +439,10 @@ Item {
 
   function finishBookmarks(output) {
     if (!root.opened || root.bookmarksLoaded) return
+    if (root.indexFailed) {
+      root.bookmarksLoaded = true
+      return
+    }
     root.bookmarksOutput = String(output || "")
     root.bookmarksLoaded = true
     root.maybeBuildIndex()
@@ -360,6 +450,10 @@ Item {
 
   function finishUnresolved(output) {
     if (!root.opened || root.unresolvedLoaded) return
+    if (root.indexFailed) {
+      root.unresolvedLoaded = true
+      return
+    }
     root.unresolvedOutput = String(output || "")
     root.unresolvedLoaded = true
     root.maybeBuildIndex()
@@ -367,19 +461,33 @@ Item {
 
   function finishRecents(output) {
     if (!root.opened || root.recentsLoaded) return
+    if (root.indexFailed) {
+      root.recentsLoaded = true
+      return
+    }
     root.recentsOutput = String(output || "")
     root.recentsLoaded = true
     root.buildRecentModel()
   }
 
   function buildRecentModel() {
-    if (!root.recentsReady) return
+    if (!root.recentsReady || root.indexFailed) return
 
     var rows = []
     var seen = ({})
-    var recentLines = root.recentsOutput.split("\n")
-    for (var i = 0; i < recentLines.length; i++) {
-      var path = root.cleanField(recentLines[i].trim())
+    var start = 0
+    var records = 0
+    while (start < root.recentsOutput.length) {
+      var end = root.recentsOutput.indexOf("\n", start)
+      if (end < 0) end = root.recentsOutput.length
+      var path = root.cleanField(root.recentsOutput.substring(start, end).trim())
+      start = end + 1
+      records += 1
+      if (records > root.maxRecents) {
+        root.failIndex("Vault index exceeds the supported recent-file limit (" + root.maxRecents + ")")
+        return
+      }
+      if (!root.checkField(path, root.maxPathBytes, "recent path")) return
       var pathKey = root.pathIndexKey(path)
       if (!path || !root.existingPathIndex[pathKey] || seen[pathKey]) continue
       seen[pathKey] = true
@@ -415,15 +523,23 @@ Item {
     }
   }
 
-  function appendSearchItem(items, rows, item) {
+  function appendSearchItem(items, rows, item, budget) {
+    if (items.length >= root.maxSearchItems)
+      return root.failIndex("Vault index exceeds the supported search-item limit (" + root.maxSearchItems + ")")
     var itemIndex = items.length
-    items.push(item)
-    rows.push([
+    var row = [
       String(itemIndex),
       root.cleanField(item.title),
       root.cleanField(item.path),
       root.cleanField(item.searchText)
-    ].join(root.fieldSeparator))
+    ].join(root.fieldSeparator)
+    var rowBytes = root.utf8Bytes(row) + 1
+    if (budget.bytes + rowBytes > root.maxFzfInputBytes)
+      return root.failIndex("Vault index exceeds the supported fuzzy-search input limit")
+    budget.bytes += rowBytes
+    items.push(item)
+    rows.push(row)
+    return true
   }
 
   function exactSearchKey(value) {
@@ -479,7 +595,7 @@ Item {
   }
 
   function maybeBuildIndex() {
-    if (root.indexBuilt || !root.filesLoaded || !root.aliasesLoaded
+    if (root.indexBuilt || root.indexFailed || !root.filesLoaded || !root.aliasesLoaded
         || !root.bookmarksLoaded || !root.unresolvedLoaded) return
 
     var byPath = ({})
@@ -491,25 +607,55 @@ Item {
       order.push(path)
     }
 
-    var aliasLines = root.aliasesOutput.split("\n")
-    for (var j = 0; j < aliasLines.length; j++) {
-      var line = aliasLines[j]
+    var aliasStart = 0
+    var aliasCount = 0
+    while (aliasStart < root.aliasesOutput.length) {
+      var aliasEnd = root.aliasesOutput.indexOf("\n", aliasStart)
+      if (aliasEnd < 0) aliasEnd = root.aliasesOutput.length
+      var line = root.aliasesOutput.substring(aliasStart, aliasEnd)
+      aliasStart = aliasEnd + 1
+      aliasCount += 1
+      if (aliasCount > root.maxAliases) {
+        root.failIndex("Vault index exceeds the supported alias limit (" + root.maxAliases + ")")
+        return
+      }
       var tab = line.indexOf("\t")
       if (tab < 1) continue
       var alias = root.cleanField(line.substring(0, tab).trim())
       var aliasPath = root.cleanField(line.substring(tab + 1).trim())
       if (!alias || !aliasPath) continue
+      if (!root.checkField(alias, root.maxLabelBytes, "alias")
+          || !root.checkField(aliasPath, root.maxPathBytes, "alias path")) return
       if (!byPath[aliasPath]) {
+        if (order.length >= root.maxFiles) {
+          root.failIndex("Vault index exceeds the supported indexed-path limit (" + root.maxFiles + ")")
+          return
+        }
         byPath[aliasPath] = { path: aliasPath, title: root.titleForPath(aliasPath), aliases: [] }
         order.push(aliasPath)
       }
-      if (byPath[aliasPath].aliases.indexOf(alias) < 0) byPath[aliasPath].aliases.push(alias)
+      if (byPath[aliasPath].aliases.indexOf(alias) < 0) {
+        if (byPath[aliasPath].aliases.length >= root.maxAliasesPerFile) {
+          root.failIndex("Vault index exceeds the supported aliases-per-file limit (" + root.maxAliasesPerFile + ")")
+          return
+        }
+        byPath[aliasPath].aliases.push(alias)
+      }
     }
 
     var bookmarksByPath = ({})
-    var bookmarkLines = root.bookmarksOutput.split("\n")
-    for (var b = 0; b < bookmarkLines.length; b++) {
-      var bookmarkLine = bookmarkLines[b]
+    var bookmarkStart = 0
+    var bookmarkCount = 0
+    while (bookmarkStart < root.bookmarksOutput.length) {
+      var bookmarkEnd = root.bookmarksOutput.indexOf("\n", bookmarkStart)
+      if (bookmarkEnd < 0) bookmarkEnd = root.bookmarksOutput.length
+      var bookmarkLine = root.bookmarksOutput.substring(bookmarkStart, bookmarkEnd)
+      bookmarkStart = bookmarkEnd + 1
+      bookmarkCount += 1
+      if (bookmarkCount > root.maxBookmarks) {
+        root.failIndex("Vault index exceeds the supported bookmark limit (" + root.maxBookmarks + ")")
+        return
+      }
       var firstTab = bookmarkLine.indexOf("\t")
       var secondTab = firstTab >= 0 ? bookmarkLine.indexOf("\t", firstTab + 1) : -1
       if (firstTab < 1 || secondTab <= firstTab + 1) continue
@@ -519,6 +665,8 @@ Item {
       var bookmarkName = root.cleanField(bookmarkLine.substring(secondTab + 1).trim())
       if (!bookmarkPath) continue
       if (!bookmarkName) bookmarkName = root.titleForPath(bookmarkPath)
+      if (!root.checkField(bookmarkPath, root.maxPathBytes, "bookmark path")
+          || !root.checkField(bookmarkName, root.maxLabelBytes, "bookmark name")) return
       if (!bookmarksByPath[bookmarkPath]) bookmarksByPath[bookmarkPath] = []
       bookmarksByPath[bookmarkPath].push({ path: bookmarkPath, name: bookmarkName })
     }
@@ -526,7 +674,13 @@ Item {
     var unresolvedItems = []
     try {
       var parsedUnresolved = JSON.parse(root.unresolvedOutput || "[]")
-      if (Array.isArray(parsedUnresolved)) unresolvedItems = parsedUnresolved
+      if (Array.isArray(parsedUnresolved)) {
+        if (parsedUnresolved.length > root.maxUnresolved) {
+          root.failIndex("Vault index exceeds the supported unresolved-link limit (" + root.maxUnresolved + ")")
+          return
+        }
+        unresolvedItems = parsedUnresolved
+      }
     } catch (e) {
       unresolvedItems = []
     }
@@ -534,11 +688,12 @@ Item {
     var notesByPath = ({})
     var searchItems = []
     var rows = []
+    var fzfBudget = { bytes: 0 }
     for (var k = 0; k < order.length; k++) {
       var note = byPath[order[k]]
       notesByPath[root.pathIndexKey(note.path)] = note
 
-      root.appendSearchItem(searchItems, rows, {
+      if (!root.appendSearchItem(searchItems, rows, {
         path: note.path,
         title: note.title,
         aliases: note.aliases.join(" · "),
@@ -547,11 +702,11 @@ Item {
         createName: "",
         fileIcon: root.iconForPath(note.path),
         searchText: note.aliases.join(" ")
-      })
+      }, fzfBudget)) return
 
       var noteBookmarks = bookmarksByPath[note.path] || []
       for (var m = 0; m < noteBookmarks.length; m++) {
-        root.appendSearchItem(searchItems, rows, {
+        if (!root.appendSearchItem(searchItems, rows, {
           path: noteBookmarks[m].path,
           title: noteBookmarks[m].name,
           aliases: "",
@@ -560,7 +715,7 @@ Item {
           createName: "",
           fileIcon: root.bookmarkIcon,
           searchText: noteBookmarks[m].name
-        })
+        }, fzfBudget)) return
       }
     }
 
@@ -570,7 +725,7 @@ Item {
       if (byPath[bookmarkPath]) continue
       var orphanBookmarks = bookmarksByPath[bookmarkPath]
       for (var n = 0; n < orphanBookmarks.length; n++) {
-        root.appendSearchItem(searchItems, rows, {
+        if (!root.appendSearchItem(searchItems, rows, {
           path: orphanBookmarks[n].path,
           title: orphanBookmarks[n].name,
           aliases: "",
@@ -579,16 +734,18 @@ Item {
           createName: "",
           fileIcon: root.bookmarkIcon,
           searchText: orphanBookmarks[n].name
-        })
+        }, fzfBudget)) return
       }
     }
 
     var unresolvedSeen = ({})
     for (var u = 0; u < unresolvedItems.length; u++) {
-      var unresolvedName = root.createableUnresolvedName(unresolvedItems[u].link)
+      var unresolvedLink = unresolvedItems[u] && unresolvedItems[u].link
+      if (!root.checkField(unresolvedLink, root.maxPathBytes, "unresolved link")) return
+      var unresolvedName = root.createableUnresolvedName(unresolvedLink)
       if (!unresolvedName || unresolvedSeen[unresolvedName]) continue
       unresolvedSeen[unresolvedName] = true
-      root.appendSearchItem(searchItems, rows, {
+      if (!root.appendSearchItem(searchItems, rows, {
         path: "",
         title: unresolvedName,
         aliases: "",
@@ -597,7 +754,7 @@ Item {
         createName: unresolvedName,
         fileIcon: root.createIcon,
         searchText: unresolvedName
-      })
+      }, fzfBudget)) return
     }
 
     root.notesByPath = notesByPath
@@ -747,13 +904,13 @@ Item {
           && worker.sessionSerial === root.sessionSerial) {
         if (worker.timedOut) {
           retryCurrent = true
-        } else {
+        } else if (worker.exitCode === 0 || worker.exitCode === 1) {
           root.applySearchOutput(worker.revision, worker.query, worker.exactIndexes, worker.collected)
-          if (worker.exitCode === 0 || worker.exitCode === 1) root.errorText = ""
-          if (worker.exitCode !== 0 && worker.exitCode !== 1
-              && worker.revision === root.searchRevision) {
+          root.errorText = ""
+        } else {
+          root.emptySearchResult = false
+          if (worker.revision === root.searchRevision)
             root.errorText = worker.errorOutput || "fzf search failed"
-          }
         }
       }
     } catch (error) {
@@ -1019,7 +1176,13 @@ Item {
       property bool started: false
 
       stdinEnabled: true
-      command: ["bash", "-c", root.fzfCommand, "obsidian-quick-switcher", worker.query]
+      command: [
+        root.boundedCommandPath,
+        String(root.maxFzfOutputBytes),
+        String(root.maxStderrBytes),
+        "fzf",
+        "bash", "-c", root.fzfCommand, "obsidian-quick-switcher", worker.query
+      ]
 
       stdout: StdioCollector {
         id: searchOutput
