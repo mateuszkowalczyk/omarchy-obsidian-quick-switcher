@@ -18,7 +18,6 @@ Item {
   property bool unresolvedLoaded: false
   property bool indexBuilt: false
   property bool cursorActive: false
-  property bool searchQueued: false
   property var activeSearchWorker: null
   property int sessionSerial: 0
   property bool emptySearchResult: false
@@ -71,7 +70,7 @@ Item {
   property int rowHeight: Math.max(Style.space(58), Math.round(Style.font.body * root.fontScale) + Math.round(Style.font.caption * root.fontScale) + Style.spacing.rowPaddingX * 2)
   property int rowSpacing: Style.spacing.xs
   property int rowPeek: Math.round(rowHeight * 0.55)
-  readonly property int searchTimeoutMs: 8000
+  readonly property int searchTimeoutMs: 3000
   property int cardWidth: Math.min(Style.space(620), panel.width - Style.gapsOut * 2)
   property int resultHeight: {
     if (!showResults) return 0
@@ -85,13 +84,8 @@ Item {
   property int cardHeight: contentMargin * 2 + headerHeight + (showResults ? contentSpacing + resultHeight : 0)
 
   readonly property string fieldSeparator: "\x1f"
-  readonly property string inputSentinel: "\x1eOMARCHY_OBSIDIAN_END\x1e"
   readonly property string fzfCommand:
-    "IFS= read -r query || exit 0; "
-    + "while IFS= read -r row; do "
-    + "[[ $row == $'\\036OMARCHY_OBSIDIAN_END\\036' ]] && break; "
-    + "printf '%s\\n' \"$row\"; "
-    + "done | fzf --filter=\"$query\" --delimiter=$'\\037' --nth=2.. "
+    "fzf --filter=\"$1\" --delimiter=$'\\037' --nth=2.. "
     + "--tiebreak=begin,length,index --no-multi | head -n 50"
   readonly property string obsidianIndexCommand:
     "vault_args=(); "
@@ -166,7 +160,6 @@ Item {
     root.unresolvedLoaded = false
     root.indexBuilt = false
     root.cursorActive = false
-    root.searchQueued = false
     root.activeSearchWorker = null
     root.emptySearchResult = false
     root.filterText = ""
@@ -628,7 +621,6 @@ Item {
       // Each run owns its output and metadata, so an in-flight query can
       // finish safely. Its revision guard discards it while recents become
       // visible immediately.
-      root.searchQueued = false
       root.selectedIndex = 0
       root.emptySearchResult = false
       root.activeResultModel = recentModel
@@ -642,27 +634,21 @@ Item {
 
   function requestSearch() {
     root.searchRevision += 1
-    root.searchQueued = true
     root.startSearch()
   }
 
   function startSearch() {
     if (root.activeSearchWorker) return
-    if (!root.opened || !root.filterText || !root.indexReady) {
-      if (!root.filterText) root.searchQueued = false
-      return
-    }
+    if (!root.opened || !root.filterText || !root.indexReady) return
 
     if (!root.fzfInput) {
-      root.searchQueued = false
       root.activeSearchQuery = root.filterText
       root.activeSearchRevision = root.searchRevision
       root.emptySearchResult = true
-      root.finishSearchProcess()
+      root.finishSearchProcess(root.searchRevision, false)
       return
     }
 
-    root.searchQueued = false
     root.activeSearchQuery = root.filterText
     root.activeSearchRevision = root.searchRevision
 
@@ -674,7 +660,6 @@ Item {
       sessionSerial: root.sessionSerial
     })
     if (!worker) {
-      root.searchQueued = false
       root.errorText = "Unable to start fzf search"
       return
     }
@@ -682,16 +667,20 @@ Item {
     root.activeSearchWorker = worker
     searchTimeout.worker = worker
     searchTimeout.restart()
+    worker.launchRequested = true
     worker.running = true
   }
 
-  function finishSearchProcess() {
-    if (root.searchQueued && root.filterText) {
+  function finishSearchProcess(completedRevision, retryCurrent) {
+    // The revision is the authoritative queue. If the query changed while
+    // this worker was running—or the worker failed transiently—run exactly
+    // the latest revision next. A separate boolean queue can lose this wakeup
+    // when completion, timeout, and typing events interleave.
+    if (root.filterText && (retryCurrent || completedRevision !== root.searchRevision)) {
       Qt.callLater(function() { root.startSearch() })
       return
     }
 
-    root.searchQueued = false
     if (root.filterText && root.emptySearchResult
         && root.activeSearchRevision === root.searchRevision
         && root.activeSearchQuery === root.filterText) {
@@ -714,11 +703,6 @@ Item {
     }
   }
 
-  function maybeFinishSearchWorker(worker) {
-    if (!worker || worker.completed || !worker.exitFinished || !worker.stdoutFinished) return
-    root.completeSearchWorker(worker)
-  }
-
   function completeSearchWorker(worker) {
     if (!worker || worker.completed) return
     worker.completed = true
@@ -734,12 +718,13 @@ Item {
 
     var isCurrent = root.activeSearchWorker === worker
     if (isCurrent) root.activeSearchWorker = null
+    var retryCurrent = false
 
     try {
       if (isCurrent && root.opened && !worker.cancelled
           && worker.sessionSerial === root.sessionSerial) {
         if (worker.timedOut) {
-          root.searchQueued = !!root.filterText
+          retryCurrent = true
         } else {
           root.applySearchOutput(worker.revision, worker.query, worker.exactIndexes, worker.collected)
           if (worker.exitCode === 0 || worker.exitCode === 1) root.errorText = ""
@@ -752,11 +737,10 @@ Item {
     } catch (error) {
       if (isCurrent && root.opened) {
         root.errorText = "Unable to process fzf results"
-        root.searchQueued = false
       }
       console.warn("Obsidian quick switcher search completion failed:", error)
     } finally {
-      if (isCurrent) root.finishSearchProcess()
+      if (isCurrent) root.finishSearchProcess(worker.revision, retryCurrent)
       Qt.callLater(function() { worker.destroy() })
     }
   }
@@ -778,8 +762,7 @@ Item {
     if (worker.running) worker.signal(9)
     Qt.callLater(function() { worker.destroy() })
 
-    root.searchQueued = !!root.filterText
-    if (root.searchQueued) Qt.callLater(function() { root.startSearch() })
+    if (root.filterText) Qt.callLater(function() { root.startSearch() })
   }
 
   function applySearchOutput(revision, query, exactIndexes, output) {
@@ -1006,39 +989,53 @@ Item {
       property string errorOutput: ""
       property int exitCode: -1
       property bool exitFinished: false
-      property bool stdoutFinished: false
       property bool timedOut: false
       property bool cancelled: false
       property bool completed: false
       property bool forceKilled: false
+      property bool launchRequested: false
+      property bool started: false
 
       stdinEnabled: true
-      command: ["bash", "-c", root.fzfCommand]
+      command: ["bash", "-c", root.fzfCommand, "obsidian-quick-switcher", worker.query]
 
       stdout: StdioCollector {
+        id: searchOutput
         waitForEnd: true
-        onStreamFinished: {
-          worker.collected = text
-          worker.stdoutFinished = true
-          root.maybeFinishSearchWorker(worker)
-        }
       }
       stderr: StdioCollector {
+        id: searchError
         waitForEnd: true
-        onStreamFinished: worker.errorOutput = String(text || "").trim()
       }
 
       onStarted: {
+        worker.started = true
         if (worker.cancelled) {
           worker.running = false
           return
         }
-        worker.write(worker.query + "\n" + worker.searchInput + root.inputSentinel + "\n")
+        // Each worker receives one immutable in-memory index, then gets an
+        // explicit EOF. This avoids depending on a sentinel surviving a large
+        // asynchronous stdin write and guarantees fzf can finish its batch.
+        worker.write(worker.searchInput)
+        worker.stdinEnabled = false
+        worker.searchInput = ""
       }
       onExited: function(code) {
+        // Quickshell finalizes StdioCollector before emitting Process.exited,
+        // so completion needs only this single event rather than two flags.
+        worker.collected = searchOutput.text
+        worker.errorOutput = String(searchError.text || "").trim()
         worker.exitCode = code
         worker.exitFinished = true
-        root.maybeFinishSearchWorker(worker)
+        root.completeSearchWorker(worker)
+      }
+      onRunningChanged: {
+        // Quickshell does not emit exited when a process fails to start.
+        // Retire that worker immediately so it cannot hold the latest query.
+        if (worker.launchRequested && !worker.running && !worker.started
+            && !worker.exitFinished && !worker.completed)
+          root.abandonSearchWorker(worker)
       }
     }
   }
@@ -1054,7 +1051,6 @@ Item {
       if (!candidate || root.activeSearchWorker !== candidate) return
 
       candidate.timedOut = true
-      root.searchQueued = !!root.filterText
       if (candidate.running) {
         candidate.running = false
         searchKillTimeout.worker = candidate
