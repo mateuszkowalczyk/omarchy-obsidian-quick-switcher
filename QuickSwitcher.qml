@@ -63,7 +63,9 @@ Item {
     if (!activeResultModel || activeResultModel.count === 0) return root.rowHeight
     var fullHeight = activeResultModel.count * root.rowHeight + Math.max(0, activeResultModel.count - 1) * root.rowSpacing
     var foldedHeight = 7 * root.rowHeight + 7 * root.rowSpacing + root.rowPeek
-    return Math.min(fullHeight, foldedHeight, Math.round(panel.height * 0.62))
+    var maxResultHeight = Math.max(root.rowHeight,
+      panel.maxCardHeight - root.contentMargin * 2 - root.headerHeight - root.contentSpacing)
+    return Math.min(fullHeight, foldedHeight, maxResultHeight)
   }
   property int cardHeight: contentMargin * 2 + headerHeight + (showResults ? contentSpacing + resultHeight : 0)
 
@@ -323,7 +325,6 @@ Item {
   }
 
   function setFilter(nextFilter) {
-    if (nextFilter) panel.freezeCardTop()
     root.filterText = nextFilter
     pointerGate.reset()
 
@@ -533,7 +534,7 @@ Item {
   ListModel { id: recentModel }
 
   // Ignore hover events caused by rows moving under a stationary pointer when
-  // the centered card resizes or a new fzf result set replaces the old one.
+  // a new fzf result set replaces the old one.
   PointerMoveGate {
     id: pointerGate
     referenceItem: card
@@ -619,18 +620,11 @@ Item {
     WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
 
-    // Match the native Omarchy launcher: the empty search card opens
-    // centered, then its top edge is frozen on the first query so result rows
-    // grow downward instead of moving underneath a stationary pointer.
-    property int cardTop: -1
-    readonly property int centeredTop: Math.max(Style.gapsOut, Math.round((height - root.cardHeight) / 2))
-    readonly property int effectiveCardTop: cardTop >= 0 ? cardTop : centeredTop
-
-    function freezeCardTop() {
-      if (visible && cardTop < 0) cardTop = effectiveCardTop
-    }
-
-    onVisibleChanged: if (!visible) cardTop = -1
+    // Keep the overlay in a predictable upper-middle position while its
+    // result list grows. The list itself is capped so the panel never grows
+    // beyond half the screen height.
+    readonly property int cardTop: Math.round(height * 0.25)
+    readonly property int maxCardHeight: Math.round(height * 0.5)
 
     Rectangle {
       anchors.fill: parent
@@ -645,10 +639,10 @@ Item {
     BorderSurface {
       id: card
       width: root.cardWidth
-      height: Math.min(root.cardHeight, panel.height - Style.gapsOut - panel.effectiveCardTop)
+      height: Math.min(root.cardHeight, panel.maxCardHeight)
       radius: root.cornerRadius
       anchors.horizontalCenter: parent.horizontalCenter
-      y: panel.effectiveCardTop
+      y: panel.cardTop
       color: root.background
       borderSpec: root.borderSpec
       padding: root.contentMargin
