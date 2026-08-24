@@ -14,6 +14,7 @@ Item {
   property bool opened: false
   property bool filesLoaded: false
   property bool aliasesLoaded: false
+  property bool bookmarksLoaded: false
   property bool cursorActive: false
   property bool stoppingProcesses: false
   property bool searchQueued: false
@@ -24,6 +25,7 @@ Item {
   property string vault: ""
   property string filesOutput: ""
   property string aliasesOutput: ""
+  property string bookmarksOutput: ""
   property string recentsOutput: ""
   property string fzfInput: ""
   property string errorText: ""
@@ -32,9 +34,10 @@ Item {
   property int activeSearchRevision: 0
   property int selectedIndex: 0
   property var notes: []
+  property var searchItems: []
   property var activeResultModel: displayModel
 
-  readonly property bool indexReady: filesLoaded && aliasesLoaded
+  readonly property bool indexReady: filesLoaded && aliasesLoaded && bookmarksLoaded
   readonly property bool showResults: opened
 
   property color background: Color.menu.background
@@ -46,6 +49,7 @@ Item {
   property color selectedText: Color.menu.selectedText
   property color selectedBorder: Color.menu.selectedBorder
   property color createActionColor: Color.accent
+  property string bookmarkIcon: "󰃀"
   property var selectedBorderSpec: Border.surfaceSpec("menu", "selected-border", selectedBorder, 0)
   readonly property real rowReservedBorderLeft: Border.left(selectedBorderSpec)
   readonly property real rowReservedBorderRight: Border.right(selectedBorderSpec)
@@ -101,6 +105,16 @@ Item {
     + "sleep 0.25; "
     + "done; "
     + "echo 'Obsidian CLI did not become ready within 15 seconds' >&2; exit 1"
+  readonly property string obsidianBookmarksCommand:
+    "vault_args=(); "
+    + "[[ -n $1 ]] && vault_args=(\"vault=$1\"); "
+    + "sleep 0.3; "
+    + "for ((attempt = 0; attempt < 12; attempt++)); do "
+    + "count=$(timeout 1 obsidian bookmarks total \"${vault_args[@]}\" 2>/dev/null | tr -d '[:space:]'); "
+    + "if [[ $count =~ ^[0-9]+$ ]]; then exec obsidian bookmarks verbose \"${vault_args[@]}\"; fi; "
+    + "sleep 0.25; "
+    + "done; "
+    + "echo 'Obsidian CLI did not become ready within 15 seconds' >&2; exit 1"
 
   function open(payloadJson) {
     var payload = {}
@@ -139,6 +153,7 @@ Item {
     root.filterText = ""
     root.filesOutput = ""
     root.aliasesOutput = ""
+    root.bookmarksOutput = ""
     root.recentsOutput = ""
     root.fzfInput = ""
     root.errorText = ""
@@ -147,6 +162,8 @@ Item {
     root.activeSearchRevision = 0
     root.selectedIndex = 0
     root.notes = []
+    root.searchItems = []
+    root.bookmarksLoaded = false
     root.recentsLoaded = false
     root.activeResultModel = recentModel
     displayModel.clear()
@@ -159,6 +176,7 @@ Item {
     root.stoppingProcesses = true
     filesProc.running = false
     aliasesProc.running = false
+    bookmarksProc.running = false
     recentProc.running = false
     searchProc.running = false
     root.searchBusy = false
@@ -168,6 +186,7 @@ Item {
   function startIndexLoad() {
     root.filesLoaded = false
     root.aliasesLoaded = false
+    root.bookmarksLoaded = false
     // A first CLI call can turn into the long-running Electron app when
     // Obsidian is closed. Launch that app detached first, then let the owned
     // scan processes poll its command server. The bracketed pgrep pattern
@@ -183,9 +202,11 @@ Item {
     filesProc.command = ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "files"]
     aliasesProc.command = ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "aliases"]
     recentProc.command = ["bash", "-c", root.obsidianRecentsCommand, "obsidian-quick-switcher", root.vault]
+    bookmarksProc.command = ["bash", "-c", root.obsidianBookmarksCommand, "obsidian-quick-switcher", root.vault]
     filesProc.running = true
     aliasesProc.running = true
     recentProc.running = true
+    bookmarksProc.running = true
   }
 
   function cleanField(value) {
@@ -207,6 +228,13 @@ Item {
     if (!root.opened) return
     root.aliasesOutput = String(output || "")
     root.aliasesLoaded = true
+    root.maybeBuildIndex()
+  }
+
+  function finishBookmarks(output) {
+    if (!root.opened) return
+    root.bookmarksOutput = String(output || "")
+    root.bookmarksLoaded = true
     root.maybeBuildIndex()
   }
 
@@ -240,6 +268,8 @@ Item {
         notePath: path,
         noteTitle: title,
         aliases: aliases,
+        bookmarkName: "",
+        isBookmark: false,
         fileIcon: root.iconForPath(path)
       })
       if (rows.length >= 50) break
@@ -255,6 +285,17 @@ Item {
       root.cursorActive = recentModel.count > 0
       pointerGate.reset()
     }
+  }
+
+  function appendSearchItem(items, rows, item) {
+    var itemIndex = items.length
+    items.push(item)
+    rows.push([
+      String(itemIndex),
+      root.cleanField(item.title),
+      root.cleanField(item.path),
+      root.cleanField(item.searchText)
+    ].join(root.fieldSeparator))
   }
 
   function maybeBuildIndex() {
@@ -285,26 +326,80 @@ Item {
       if (byPath[aliasPath].aliases.indexOf(alias) < 0) byPath[aliasPath].aliases.push(alias)
     }
 
+    var bookmarksByPath = ({})
+    var bookmarkLines = root.bookmarksOutput.split("\n")
+    for (var b = 0; b < bookmarkLines.length; b++) {
+      var bookmarkLine = bookmarkLines[b]
+      var firstTab = bookmarkLine.indexOf("\t")
+      var secondTab = firstTab >= 0 ? bookmarkLine.indexOf("\t", firstTab + 1) : -1
+      if (firstTab < 1 || secondTab <= firstTab + 1) continue
+      var bookmarkType = bookmarkLine.substring(0, firstTab).trim()
+      if (bookmarkType !== "file") continue
+      var bookmarkPath = root.cleanField(bookmarkLine.substring(firstTab + 1, secondTab).trim())
+      var bookmarkName = root.cleanField(bookmarkLine.substring(secondTab + 1).trim())
+      if (!bookmarkPath) continue
+      if (!bookmarkName) bookmarkName = root.titleForPath(bookmarkPath)
+      if (!bookmarksByPath[bookmarkPath]) bookmarksByPath[bookmarkPath] = []
+      bookmarksByPath[bookmarkPath].push({ path: bookmarkPath, name: bookmarkName })
+    }
+
     var nextNotes = []
+    var searchItems = []
     var rows = []
     for (var k = 0; k < order.length; k++) {
       var note = byPath[order[k]]
-      var noteIndex = nextNotes.length
       nextNotes.push(note)
-      rows.push([
-        String(noteIndex),
-        root.cleanField(note.title),
-        root.cleanField(note.path),
-        root.cleanField(note.aliases.join(" "))
-      ].join(root.fieldSeparator))
+
+      root.appendSearchItem(searchItems, rows, {
+        path: note.path,
+        title: note.title,
+        aliases: note.aliases.join(" · "),
+        bookmarkName: "",
+        isBookmark: false,
+        fileIcon: root.iconForPath(note.path),
+        searchText: note.aliases.join(" ")
+      })
+
+      var noteBookmarks = bookmarksByPath[note.path] || []
+      for (var m = 0; m < noteBookmarks.length; m++) {
+        root.appendSearchItem(searchItems, rows, {
+          path: noteBookmarks[m].path,
+          title: noteBookmarks[m].name,
+          aliases: "",
+          bookmarkName: noteBookmarks[m].name,
+          isBookmark: true,
+          fileIcon: root.bookmarkIcon,
+          searchText: noteBookmarks[m].name
+        })
+      }
+    }
+
+    // Keep bookmarks to paths that are not present in `obsidian files`
+    // searchable as well, while retaining every bookmark as a separate row.
+    for (var bookmarkPath in bookmarksByPath) {
+      if (byPath[bookmarkPath]) continue
+      var orphanBookmarks = bookmarksByPath[bookmarkPath]
+      for (var n = 0; n < orphanBookmarks.length; n++) {
+        root.appendSearchItem(searchItems, rows, {
+          path: orphanBookmarks[n].path,
+          title: orphanBookmarks[n].name,
+          aliases: "",
+          bookmarkName: orphanBookmarks[n].name,
+          isBookmark: true,
+          fileIcon: root.bookmarkIcon,
+          searchText: orphanBookmarks[n].name
+        })
+      }
     }
 
     root.notes = nextNotes
+    root.searchItems = searchItems
     root.fzfInput = rows.join("\n") + (rows.length ? "\n" : "")
     if (root.recentsLoaded) root.buildRecentModel()
     // Release the raw command output once the compact in-memory index exists.
     root.filesOutput = ""
     root.aliasesOutput = ""
+    root.bookmarksOutput = ""
     if (root.filterText) root.requestSearch()
   }
 
@@ -386,7 +481,9 @@ Item {
           notePath: "",
           noteTitle: root.filterText,
           aliases: "",
-          fileIcon: "󰐖"
+          bookmarkName: "",
+          isBookmark: false,
+          fileIcon: "󰝒"
         })
         root.activeResultModel = emptyModel
         root.emptySearchResult = false
@@ -409,14 +506,16 @@ Item {
       if (!lines[i]) continue
       var separator = lines[i].indexOf(root.fieldSeparator)
       var indexText = separator >= 0 ? lines[i].substring(0, separator) : lines[i]
-      var noteIndex = Number(indexText)
-      if (!Number.isInteger(noteIndex) || noteIndex < 0 || noteIndex >= root.notes.length) continue
-      var note = root.notes[noteIndex]
+      var itemIndex = Number(indexText)
+      if (!Number.isInteger(itemIndex) || itemIndex < 0 || itemIndex >= root.searchItems.length) continue
+      var item = root.searchItems[itemIndex]
       nextRows.push({
-        notePath: note.path,
-        noteTitle: note.title,
-        aliases: note.aliases.join(" · "),
-        fileIcon: root.iconForPath(note.path)
+        notePath: item.path,
+        noteTitle: item.title,
+        aliases: item.aliases,
+        bookmarkName: item.bookmarkName,
+        isBookmark: item.isBookmark,
+        fileIcon: item.fileIcon
       })
     }
 
@@ -580,6 +679,19 @@ Item {
   }
 
   Process {
+    id: bookmarksProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.finishBookmarks(text)
+    }
+    stderr: StdioCollector { id: bookmarksErrorCollector; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (root.opened && !root.stoppingProcesses && exitCode !== 0 && !root.bookmarksLoaded)
+        root.finishBookmarks("")
+    }
+  }
+
+  Process {
     id: searchProc
     stdinEnabled: true
     property int revision: 0
@@ -735,6 +847,8 @@ Item {
               required property string notePath
               required property string noteTitle
               required property string aliases
+              required property string bookmarkName
+              required property bool isBookmark
               required property string fileIcon
 
               readonly property bool isCreateRow: !row.notePath
@@ -747,7 +861,7 @@ Item {
 
               Text {
                 id: iconText
-                text: row.isCreateRow ? "󰐖" : row.fileIcon
+                text: row.isCreateRow ? "󰝒" : (row.isBookmark ? root.bookmarkIcon : row.fileIcon)
                 color: row.hasCursor ? root.selectedText : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.iconLarge
@@ -781,7 +895,9 @@ Item {
                   width: parent.width
                   text: row.isCreateRow
                     ? "↵ to create"
-                    : root.highlighted(row.notePath + (row.aliases ? "  ·  " + row.aliases : ""))
+                    : root.highlighted(row.isBookmark
+                      ? row.bookmarkName
+                      : row.notePath + (row.aliases ? "  ·  " + row.aliases : ""))
                   textFormat: row.isCreateRow ? Text.PlainText : Text.RichText
                   color: row.isCreateRow
                     ? (row.hasCursor ? root.selectedText : root.createActionColor)
@@ -821,7 +937,7 @@ Item {
             width: parent.width - Style.space(24)
             visible: !root.activeResultModel || root.activeResultModel.count === 0
             text: root.filterText
-              ? (root.errorText || (!root.indexReady ? "Loading files and aliases…" : "No matching files"))
+              ? (root.errorText || (!root.indexReady ? "Loading files, aliases, and bookmarks…" : "No matching files"))
               : (!root.recentsLoaded ? "Loading recent notes…" : "No recent notes")
             color: root.foreground
             opacity: 0.58
