@@ -64,10 +64,11 @@ Item {
   readonly property real rowReservedBorderRight: Border.right(selectedBorderSpec)
   readonly property int cornerRadius: Style.cornerRadius
   property string fontFamily: Style.font.menuFamily
+  property real fontScale: 1.15
   property int contentMargin: Style.spacing.panelPadding
-  property int headerHeight: Math.max(Style.space(42), Style.font.title + Style.spacing.controlPaddingY * 2)
+  property int headerHeight: Math.max(Style.space(42), Math.round(Style.font.title * root.fontScale) + Style.spacing.controlPaddingY * 2)
   property int contentSpacing: Style.spacing.md
-  property int rowHeight: Math.max(Style.space(58), Style.font.body + Style.font.caption + Style.spacing.rowPaddingX * 2)
+  property int rowHeight: Math.max(Style.space(58), Math.round(Style.font.body * root.fontScale) + Math.round(Style.font.caption * root.fontScale) + Style.spacing.rowPaddingX * 2)
   property int rowSpacing: Style.spacing.xs
   property int rowPeek: Math.round(rowHeight * 0.55)
   readonly property int searchTimeoutMs: 8000
@@ -1193,7 +1194,7 @@ Item {
             color: root.foreground
             opacity: root.filterText ? 1 : 0.58
             font.family: root.fontFamily
-            font.pixelSize: Style.font.heading
+            font.pixelSize: Math.round(Style.font.heading * root.fontScale)
             elide: Text.ElideRight
           }
         }
@@ -1235,7 +1236,7 @@ Item {
                 text: row.isCreateRow ? root.createIcon : (row.isBookmark ? root.bookmarkIcon : row.fileIcon)
                 color: row.hasCursor ? root.selectedText : root.foreground
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.iconLarge
+                font.pixelSize: Math.round(Style.font.iconLarge * root.fontScale)
                 width: Style.space(36)
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
@@ -1258,7 +1259,7 @@ Item {
                   textFormat: Text.RichText
                   color: row.hasCursor ? root.selectedText : root.foreground
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
+                  font.pixelSize: Math.round(Style.font.body * root.fontScale)
                   elide: Text.ElideRight
                 }
 
@@ -1275,7 +1276,7 @@ Item {
                     : (row.hasCursor ? root.selectedText : root.foreground)
                   opacity: row.isCreateRow ? 1 : 0.62
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: Math.round(Style.font.caption * root.fontScale)
                   horizontalAlignment: Text.AlignLeft
                   elide: Text.ElideRight
                 }
@@ -1313,7 +1314,7 @@ Item {
             color: root.foreground
             opacity: 0.58
             font.family: root.fontFamily
-            font.pixelSize: Style.font.body
+            font.pixelSize: Math.round(Style.font.body * root.fontScale)
             horizontalAlignment: Text.AlignHCenter
             elide: Text.ElideRight
           }
