@@ -888,6 +888,12 @@ Item {
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))
             event.accepted = true
+          } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_P) {
+            root.select(-1)
+            event.accepted = true
+          } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_N) {
+            root.select(1)
+            event.accepted = true
           } else if (event.key === Qt.Key_Up) {
             root.select(-1)
             event.accepted = true

@@ -66,7 +66,7 @@ hyprctl configerrors
 | Key | Action |
 | --- | --- |
 | Type | Fuzzy-search file names, paths, aliases, bookmarks, and unresolved links; exact matches are promoted |
-| `↑` / `↓` | Move through results |
+| `↑` / `↓` or `Ctrl` + `P` / `N` | Move through results |
 | `Page Up` / `Page Down` | Move by a page |
 | `Enter` | Open the selected file through `obsidian open path=...` |
 | `Shift` + `Enter` | Create and open a new note using the query |
