@@ -23,6 +23,12 @@ want.
 omarchy plugin add https://github.com/mateuszkowalczyk/omarchy-obsidian-quick-switcher --enable
 ```
 
+### Enable the Obsidian CLI
+
+In Obsidian, go to **Settings → General → Advanced** and turn on **Command line
+interface**. The switcher uses the CLI to find and open files in
+your vault.
+
 ## Binding
 
 Add this to `~/.config/hypr/bindings.lua`:
