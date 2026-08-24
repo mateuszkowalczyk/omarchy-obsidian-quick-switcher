@@ -606,6 +606,7 @@ Item {
 
   function iconForPath(path) {
     var lower = String(path || "").toLocaleLowerCase()
+    if (/\.base$/.test(lower)) return "󰆼"
     if (/\.md$/.test(lower)) return ""
     if (/\.html?$/.test(lower)) return "󰌝"
     if (/\.css$/.test(lower)) return "󰌜"
