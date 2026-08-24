@@ -42,7 +42,7 @@ The switcher launches Obsidian automatically if it is not already running.
 
 | Key | Action |
 | --- | --- |
-| Type | Fuzzy-search file names, paths, aliases, bookmarks, and unresolved links; exact matches are promoted |
+| Type | Fuzzy-search file names, paths, aliases, bookmarks, and unresolved links |
 | `↑` / `↓` or `Ctrl` + `P` / `N` | Move through results |
 | `Page Up` / `Page Down` | Move by a page |
 | `Enter` | Open the selected file |
