@@ -1,108 +1,53 @@
 # Obsidian Quick Switcher for Omarchy
 
-A native Omarchy search overlay for opening any Obsidian vault file by name,
-path, alias, bookmark name, or unresolved linked-note target. Recent Obsidian
-files appear while the vault index loads asynchronously from the Obsidian CLI,
-then the list is fuzzy-filtered with headless fzf on every keystroke.
+An Omarchy search panel that tries to feel like Obsidian's built-in Quick
+Switcher. Press a shortcut, start typing, and jump straight to the file you
+want.
+
+- Fuzzy-search every vault file - not just Markdown
+- Search aliases and bookmarks
+- Create missing linked notes or a new note from any query
+- Open files in Obsidian, launching Obsidian first when needed
+
+<!-- Screenshot goes here. -->
 
 ## Requirements
 
-- Omarchy 4 or newer with `omarchy-shell`
+- Omarchy Quattro or newer
 - Obsidian with its CLI enabled
 - `fzf`
 
-Verify the external tools before installing:
-
-```bash
-obsidian files | head
-obsidian aliases verbose | head
-obsidian bookmarks verbose | head
-obsidian unresolved verbose format=json | head
-fzf --version
-```
-
 ## Install
 
-Once this repository is published, install and enable it with:
-
 ```bash
-omarchy plugin add https://github.com/mateuszkowalczyk/omarchy-obsidian-quick-switcher --enable
+omarchy plugin install https://github.com/mateuszkowalczyk/omarchy-obsidian-quick-switcher --enable
 ```
 
-For a local checkout, sync it to the user plugin directory, validate it, and
-enable it:
+## Binding
 
-```bash
-mkdir -p ~/.config/omarchy/plugins/mk.obsidian-quick-switcher
-rsync -a --exclude .git \
-  ./ ~/.config/omarchy/plugins/mk.obsidian-quick-switcher/
-omarchy plugin validate ~/.config/omarchy/plugins/mk.obsidian-quick-switcher
-omarchy-shell shell rescanPlugins
-omarchy plugin enable mk.obsidian-quick-switcher
-```
-
-Add this to `~/.config/hypr/bindings.lua`. It deliberately replaces Omarchy's
-standard Obsidian launcher, so the same shortcut now opens the quick switcher:
+Add this to `~/.config/hypr/bindings.lua`:
 
 ```lua
--- SUPER + SHIFT + O was previously bound to: Obsidian
 hl.unbind("SUPER + SHIFT + O")
 o.bind(
   "SUPER + SHIFT + O",
   "Obsidian quick switcher",
-  "omarchy-shell shell toggle mk.obsidian-quick-switcher '{}'"
+  "omarchy-shell shell toggle mateuszkowalczyk.obsidian-quick-switcher '{}'"
 )
 ```
 
-Hyprland reloads the file automatically. Validate it with:
+The switcher launches Obsidian automatically if it is not already running.
 
-```bash
-hyprctl reload
-hyprctl configerrors
-```
-
-## Use
+## Keys
 
 | Key | Action |
 | --- | --- |
 | Type | Fuzzy-search file names, paths, aliases, bookmarks, and unresolved links; exact matches are promoted |
 | `↑` / `↓` or `Ctrl` + `P` / `N` | Move through results |
 | `Page Up` / `Page Down` | Move by a page |
-| `Enter` | Open the selected file through `obsidian open path=...` |
+| `Enter` | Open the selected file |
 | `Shift` + `Enter` | Create and open a new note using the query |
 | `Esc` | Clear the query, then close the panel |
-
-Each invocation starts `obsidian files`, `obsidian aliases verbose`,
-`obsidian bookmarks verbose`, `obsidian unresolved verbose format=json`, and
-`obsidian recents` in parallel. Bookmarked files appear as separate bookmark
-results, including duplicate file entries. Unresolved internal links appear as
-file-plus create actions; external URLs and obvious template expressions are
-ignored. Pressing Enter on one creates the linked note by its full target name.
-An exact title, path, alias, bookmark name, or create target is promoted ahead
-of longer fuzzy matches.
-Recent files are shown until the first query response is ready; if there are
-no matches, the query becomes a create action. QML merges the CLI output and
-keeps the resulting index in memory for that panel session. There is no
-debounce: every query revision starts a short-lived headless fzf process
-immediately, while the previous results remain visible until their replacement
-is ready. The panel starts at roughly one quarter of the screen height and
-never grows beyond half the screen height. If Obsidian is closed, the plugin
-waits for its CLI command server to become ready before loading the index.
-Closing the panel terminates active Obsidian/fzf processes and clears the
-in-memory index.
-
-To target a named vault, pass it in the summon payload:
-
-```bash
-omarchy-shell shell summon mk.obsidian-quick-switcher '{"vault":"My vault"}'
-```
-
-## Development
-
-```bash
-omarchy plugin validate .
-qmllint -I /usr/share/omarchy/shell QuickSwitcher.qml
-```
 
 ## License
 

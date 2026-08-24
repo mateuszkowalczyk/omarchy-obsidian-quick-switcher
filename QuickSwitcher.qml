@@ -149,7 +149,7 @@ Item {
 
   function dismiss() {
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "mk.obsidian-quick-switcher")
+      root.shell.hide((root.manifest && root.manifest.id) || "mateuszkowalczyk.obsidian-quick-switcher")
     else
       root.close()
   }
