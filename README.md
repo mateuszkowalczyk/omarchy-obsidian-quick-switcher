@@ -1,9 +1,9 @@
 # Obsidian Quick Switcher for Omarchy
 
 A native Omarchy search overlay for opening any Obsidian vault file by name,
-path, alias, or bookmark name. Recent Obsidian files appear while the vault
-index loads asynchronously from the Obsidian CLI, then the list is
-fuzzy-filtered with headless fzf on every keystroke.
+path, alias, bookmark name, or unresolved linked-note target. Recent Obsidian
+files appear while the vault index loads asynchronously from the Obsidian CLI,
+then the list is fuzzy-filtered with headless fzf on every keystroke.
 
 ## Requirements
 
@@ -17,6 +17,7 @@ Verify the external tools before installing:
 obsidian files | head
 obsidian aliases verbose | head
 obsidian bookmarks verbose | head
+obsidian unresolved verbose format=json | head
 fzf --version
 ```
 
@@ -64,7 +65,7 @@ hyprctl configerrors
 
 | Key | Action |
 | --- | --- |
-| Type | Fuzzy-search file names, paths, aliases, and bookmark names |
+| Type | Fuzzy-search file names, paths, aliases, bookmarks, and unresolved links |
 | `↑` / `↓` | Move through results |
 | `Page Up` / `Page Down` | Move by a page |
 | `Enter` | Open the selected file through `obsidian open path=...` |
@@ -72,8 +73,11 @@ hyprctl configerrors
 | `Esc` | Clear the query, then close the panel |
 
 Each invocation starts `obsidian files`, `obsidian aliases verbose`,
-`obsidian bookmarks verbose`, and `obsidian recents` in parallel. Bookmarked
-files appear as separate bookmark results, including duplicate file entries.
+`obsidian bookmarks verbose`, `obsidian unresolved verbose format=json`, and
+`obsidian recents` in parallel. Bookmarked files appear as separate bookmark
+results, including duplicate file entries. Unresolved internal links appear as
+file-plus create actions; external URLs and obvious template expressions are
+ignored. Pressing Enter on one creates the linked note by its full target name.
 Recent files are shown until the first query response is ready; if there are
 no matches, the query becomes a create action. QML merges the CLI output and
 keeps the resulting index in memory for that panel session. There is no

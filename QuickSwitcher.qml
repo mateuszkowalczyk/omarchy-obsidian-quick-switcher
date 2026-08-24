@@ -15,6 +15,7 @@ Item {
   property bool filesLoaded: false
   property bool aliasesLoaded: false
   property bool bookmarksLoaded: false
+  property bool unresolvedLoaded: false
   property bool cursorActive: false
   property bool stoppingProcesses: false
   property bool searchQueued: false
@@ -26,6 +27,7 @@ Item {
   property string filesOutput: ""
   property string aliasesOutput: ""
   property string bookmarksOutput: ""
+  property string unresolvedOutput: ""
   property string recentsOutput: ""
   property string fzfInput: ""
   property string errorText: ""
@@ -37,7 +39,7 @@ Item {
   property var searchItems: []
   property var activeResultModel: displayModel
 
-  readonly property bool indexReady: filesLoaded && aliasesLoaded && bookmarksLoaded
+  readonly property bool indexReady: filesLoaded && aliasesLoaded && bookmarksLoaded && unresolvedLoaded
   readonly property bool showResults: opened
 
   property color background: Color.menu.background
@@ -50,6 +52,7 @@ Item {
   property color selectedBorder: Color.menu.selectedBorder
   property color createActionColor: Color.accent
   property string bookmarkIcon: "󰃀"
+  property string createIcon: "󰝒"
   property var selectedBorderSpec: Border.surfaceSpec("menu", "selected-border", selectedBorder, 0)
   readonly property real rowReservedBorderLeft: Border.left(selectedBorderSpec)
   readonly property real rowReservedBorderRight: Border.right(selectedBorderSpec)
@@ -90,6 +93,7 @@ Item {
     + "count=$(timeout 1 obsidian files total \"${vault_args[@]}\" 2>/dev/null | tr -d '[:space:]'); "
     + "if [[ $count =~ ^[0-9]+$ ]]; then "
     + "if [[ $2 == files ]]; then exec obsidian files \"${vault_args[@]}\"; "
+    + "elif [[ $2 == unresolved ]]; then exec obsidian unresolved verbose format=json \"${vault_args[@]}\"; "
     + "else exec obsidian aliases verbose \"${vault_args[@]}\"; fi; "
     + "fi; "
     + "sleep 0.25; "
@@ -146,6 +150,7 @@ Item {
   function clearSession() {
     root.filesLoaded = false
     root.aliasesLoaded = false
+    root.unresolvedLoaded = false
     root.cursorActive = false
     root.searchQueued = false
     root.searchBusy = false
@@ -154,6 +159,7 @@ Item {
     root.filesOutput = ""
     root.aliasesOutput = ""
     root.bookmarksOutput = ""
+    root.unresolvedOutput = ""
     root.recentsOutput = ""
     root.fzfInput = ""
     root.errorText = ""
@@ -177,6 +183,7 @@ Item {
     filesProc.running = false
     aliasesProc.running = false
     bookmarksProc.running = false
+    unresolvedProc.running = false
     recentProc.running = false
     searchProc.running = false
     root.searchBusy = false
@@ -187,6 +194,7 @@ Item {
     root.filesLoaded = false
     root.aliasesLoaded = false
     root.bookmarksLoaded = false
+    root.unresolvedLoaded = false
     // A first CLI call can turn into the long-running Electron app when
     // Obsidian is closed. Launch that app detached first, then let the owned
     // scan processes poll its command server. The bracketed pgrep pattern
@@ -201,10 +209,12 @@ Item {
     // vaults remain valid because zero is a numeric readiness response.
     filesProc.command = ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "files"]
     aliasesProc.command = ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "aliases"]
+    unresolvedProc.command = ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "unresolved"]
     recentProc.command = ["bash", "-c", root.obsidianRecentsCommand, "obsidian-quick-switcher", root.vault]
     bookmarksProc.command = ["bash", "-c", root.obsidianBookmarksCommand, "obsidian-quick-switcher", root.vault]
     filesProc.running = true
     aliasesProc.running = true
+    unresolvedProc.running = true
     recentProc.running = true
     bookmarksProc.running = true
   }
@@ -235,6 +245,13 @@ Item {
     if (!root.opened) return
     root.bookmarksOutput = String(output || "")
     root.bookmarksLoaded = true
+    root.maybeBuildIndex()
+  }
+
+  function finishUnresolved(output) {
+    if (!root.opened) return
+    root.unresolvedOutput = String(output || "")
+    root.unresolvedLoaded = true
     root.maybeBuildIndex()
   }
 
@@ -270,6 +287,7 @@ Item {
         aliases: aliases,
         bookmarkName: "",
         isBookmark: false,
+        createName: "",
         fileIcon: root.iconForPath(path)
       })
       if (rows.length >= 50) break
@@ -296,6 +314,24 @@ Item {
       root.cleanField(item.path),
       root.cleanField(item.searchText)
     ].join(root.fieldSeparator))
+  }
+
+  function createableUnresolvedName(value) {
+    var name = root.cleanField(value).trim()
+    if (!name || /^<%[\s\S]*%>$/.test(name)) return ""
+    if (/(?:https?|ftp|mailto|file):\/\//i.test(name) || name.indexOf("://") >= 0) return ""
+
+    // A link may include an alias or a heading/block subpath. The switcher
+    // creates the note target, not the display alias or subpath.
+    var pipe = name.indexOf("|")
+    if (pipe > 0) name = name.substring(0, pipe).trim()
+    var hash = name.indexOf("#")
+    if (hash === 0) return ""
+    if (hash > 0) name = name.substring(0, hash).trim()
+    var caret = name.indexOf("^")
+    if (caret === 0) return ""
+    if (caret > 0) name = name.substring(0, caret).trim()
+    return name
   }
 
   function maybeBuildIndex() {
@@ -343,6 +379,14 @@ Item {
       bookmarksByPath[bookmarkPath].push({ path: bookmarkPath, name: bookmarkName })
     }
 
+    var unresolvedItems = []
+    try {
+      var parsedUnresolved = JSON.parse(root.unresolvedOutput || "[]")
+      if (Array.isArray(parsedUnresolved)) unresolvedItems = parsedUnresolved
+    } catch (e) {
+      unresolvedItems = []
+    }
+
     var nextNotes = []
     var searchItems = []
     var rows = []
@@ -356,6 +400,7 @@ Item {
         aliases: note.aliases.join(" · "),
         bookmarkName: "",
         isBookmark: false,
+        createName: "",
         fileIcon: root.iconForPath(note.path),
         searchText: note.aliases.join(" ")
       })
@@ -368,6 +413,7 @@ Item {
           aliases: "",
           bookmarkName: noteBookmarks[m].name,
           isBookmark: true,
+          createName: "",
           fileIcon: root.bookmarkIcon,
           searchText: noteBookmarks[m].name
         })
@@ -386,10 +432,28 @@ Item {
           aliases: "",
           bookmarkName: orphanBookmarks[n].name,
           isBookmark: true,
+          createName: "",
           fileIcon: root.bookmarkIcon,
           searchText: orphanBookmarks[n].name
         })
       }
+    }
+
+    var unresolvedSeen = ({})
+    for (var u = 0; u < unresolvedItems.length; u++) {
+      var unresolvedName = root.createableUnresolvedName(unresolvedItems[u].link)
+      if (!unresolvedName || unresolvedSeen[unresolvedName]) continue
+      unresolvedSeen[unresolvedName] = true
+      root.appendSearchItem(searchItems, rows, {
+        path: "",
+        title: unresolvedName,
+        aliases: "",
+        bookmarkName: "",
+        isBookmark: false,
+        createName: unresolvedName,
+        fileIcon: root.createIcon,
+        searchText: unresolvedName
+      })
     }
 
     root.notes = nextNotes
@@ -400,6 +464,7 @@ Item {
     root.filesOutput = ""
     root.aliasesOutput = ""
     root.bookmarksOutput = ""
+    root.unresolvedOutput = ""
     if (root.filterText) root.requestSearch()
   }
 
@@ -483,7 +548,8 @@ Item {
           aliases: "",
           bookmarkName: "",
           isBookmark: false,
-          fileIcon: "󰝒"
+          createName: root.filterText,
+          fileIcon: root.createIcon
         })
         root.activeResultModel = emptyModel
         root.emptySearchResult = false
@@ -515,6 +581,7 @@ Item {
         aliases: item.aliases,
         bookmarkName: item.bookmarkName,
         isBookmark: item.isBookmark,
+        createName: item.createName,
         fileIcon: item.fileIcon
       })
     }
@@ -564,7 +631,7 @@ Item {
     if (index < 0 || index >= root.activeResultModel.count) return
     var row = root.activeResultModel.get(index)
     if (!row.notePath) {
-      root.createNote()
+      root.createNote(row.createName || root.filterText)
       return
     }
 
@@ -574,8 +641,8 @@ Item {
     Quickshell.execDetached(args)
   }
 
-  function createNote() {
-    var name = root.filterText.trim()
+  function createNote(requestedName) {
+    var name = String(requestedName || root.filterText).trim()
     if (!name) return
 
     var args = ["obsidian", "create", "name=" + name, "open"]
@@ -688,6 +755,21 @@ Item {
     onExited: function(exitCode) {
       if (root.opened && !root.stoppingProcesses && exitCode !== 0 && !root.bookmarksLoaded)
         root.finishBookmarks("")
+    }
+  }
+
+  Process {
+    id: unresolvedProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.finishUnresolved(text)
+    }
+    stderr: StdioCollector { id: unresolvedErrorCollector; waitForEnd: true }
+    onExited: function(exitCode) {
+      // Unresolved links are an enhancement; an unavailable command should
+      // not prevent ordinary file search from becoming ready.
+      if (root.opened && !root.stoppingProcesses && exitCode !== 0 && !root.unresolvedLoaded)
+        root.finishUnresolved("")
     }
   }
 
@@ -849,6 +931,7 @@ Item {
               required property string aliases
               required property string bookmarkName
               required property bool isBookmark
+              required property string createName
               required property string fileIcon
 
               readonly property bool isCreateRow: !row.notePath
@@ -861,7 +944,7 @@ Item {
 
               Text {
                 id: iconText
-                text: row.isCreateRow ? "󰝒" : (row.isBookmark ? root.bookmarkIcon : row.fileIcon)
+                text: row.isCreateRow ? root.createIcon : (row.isBookmark ? root.bookmarkIcon : row.fileIcon)
                 color: row.hasCursor ? root.selectedText : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.iconLarge
@@ -937,7 +1020,7 @@ Item {
             width: parent.width - Style.space(24)
             visible: !root.activeResultModel || root.activeResultModel.count === 0
             text: root.filterText
-              ? (root.errorText || (!root.indexReady ? "Loading files, aliases, and bookmarks…" : "No matching files"))
+              ? (root.errorText || (!root.indexReady ? "Loading files, aliases, bookmarks, and links…" : "No matching files"))
               : (!root.recentsLoaded ? "Loading recent notes…" : "No recent notes")
             color: root.foreground
             opacity: 0.58
