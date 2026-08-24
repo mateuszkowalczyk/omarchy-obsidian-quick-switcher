@@ -16,10 +16,10 @@ Item {
   property bool aliasesLoaded: false
   property bool bookmarksLoaded: false
   property bool unresolvedLoaded: false
+  property bool indexBuilt: false
   property bool cursorActive: false
-  property bool stoppingProcesses: false
   property bool searchQueued: false
-  property bool searchBusy: false
+  property var activeSearchWorker: null
   property int sessionSerial: 0
   property bool emptySearchResult: false
   property bool recentsLoaded: false
@@ -38,9 +38,11 @@ Item {
   property int selectedIndex: 0
   property var notes: []
   property var searchItems: []
+  property var exactSearchIndex: ({})
+  property var indexWorkers: []
   property var activeResultModel: displayModel
 
-  readonly property bool indexReady: filesLoaded && aliasesLoaded && bookmarksLoaded && unresolvedLoaded
+  readonly property bool indexReady: indexBuilt
   readonly property bool showResults: opened
 
   property color background: Color.menu.background
@@ -86,7 +88,7 @@ Item {
     + "[[ $row == $'\\036OMARCHY_OBSIDIAN_END\\036' ]] && break; "
     + "printf '%s\\n' \"$row\"; "
     + "done | fzf --filter=\"$query\" --delimiter=$'\\037' --nth=2.. "
-    + "--tiebreak=begin,length,index --no-multi"
+    + "--tiebreak=begin,length,index --no-multi | head -n 50"
   readonly property string obsidianIndexCommand:
     "vault_args=(); "
     + "[[ -n $1 ]] && vault_args=(\"vault=$1\"); "
@@ -152,14 +154,16 @@ Item {
   function clearSession() {
     root.sessionSerial += 1
     searchTimeout.stop()
+    searchTimeout.worker = null
+    searchKillTimeout.stop()
+    searchKillTimeout.worker = null
     root.filesLoaded = false
     root.aliasesLoaded = false
     root.unresolvedLoaded = false
+    root.indexBuilt = false
     root.cursorActive = false
     root.searchQueued = false
-    root.searchBusy = false
-    searchProc.timedOut = false
-    searchProc.collected = ""
+    root.activeSearchWorker = null
     root.emptySearchResult = false
     root.filterText = ""
     root.filesOutput = ""
@@ -175,6 +179,8 @@ Item {
     root.selectedIndex = 0
     root.notes = []
     root.searchItems = []
+    root.exactSearchIndex = ({})
+    root.indexWorkers = []
     root.bookmarksLoaded = false
     root.recentsLoaded = false
     root.activeResultModel = recentModel
@@ -185,18 +191,30 @@ Item {
   }
 
   function stopProcesses() {
-    root.stoppingProcesses = true
     searchTimeout.stop()
-    filesProc.running = false
-    aliasesProc.running = false
-    bookmarksProc.running = false
-    unresolvedProc.running = false
-    recentProc.running = false
-    searchProc.running = false
-    searchProc.timedOut = false
-    searchProc.collected = ""
-    root.searchBusy = false
-    root.stoppingProcesses = false
+    searchTimeout.worker = null
+    searchKillTimeout.stop()
+    searchKillTimeout.worker = null
+    var indexWorkerList = root.indexWorkers
+    root.indexWorkers = []
+    for (var i = 0; i < indexWorkerList.length; i++) {
+      var indexWorker = indexWorkerList[i]
+      if (!indexWorker) continue
+      indexWorker.cancelled = true
+      indexWorker.completed = true
+      if (indexWorker.running) indexWorker.running = false
+      Qt.callLater((function(workerToDestroy) {
+        return function() { workerToDestroy.destroy() }
+      })(indexWorker))
+    }
+    var worker = root.activeSearchWorker
+    root.activeSearchWorker = null
+    if (worker) {
+      worker.cancelled = true
+      worker.completed = true
+      if (worker.running) worker.running = false
+      Qt.callLater(function() { worker.destroy() })
+    }
   }
 
   function startIndexLoad() {
@@ -216,16 +234,60 @@ Item {
     // Poll a numeric file count before the real scans. Each probe is bounded
     // because a startup race must not turn a scan process into the app. Empty
     // vaults remain valid because zero is a numeric readiness response.
-    filesProc.command = ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "files"]
-    aliasesProc.command = ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "aliases"]
-    unresolvedProc.command = ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "unresolved"]
-    recentProc.command = ["bash", "-c", root.obsidianRecentsCommand, "obsidian-quick-switcher", root.vault]
-    bookmarksProc.command = ["bash", "-c", root.obsidianBookmarksCommand, "obsidian-quick-switcher", root.vault]
-    filesProc.running = true
-    aliasesProc.running = true
-    unresolvedProc.running = true
-    recentProc.running = true
-    bookmarksProc.running = true
+    root.startIndexWorker("files", ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "files"])
+    root.startIndexWorker("aliases", ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "aliases"])
+    root.startIndexWorker("unresolved", ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "unresolved"])
+    root.startIndexWorker("recents", ["bash", "-c", root.obsidianRecentsCommand, "obsidian-quick-switcher", root.vault])
+    root.startIndexWorker("bookmarks", ["bash", "-c", root.obsidianBookmarksCommand, "obsidian-quick-switcher", root.vault])
+  }
+
+  function startIndexWorker(kind, command) {
+    var worker = indexWorkerComponent.createObject(root, {
+      kind: kind,
+      sessionSerial: root.sessionSerial,
+      command: command
+    })
+    if (!worker) {
+      root.finishIndexKind(kind, "", "Unable to start Obsidian CLI")
+      return
+    }
+    var nextWorkers = root.indexWorkers.slice()
+    nextWorkers.push(worker)
+    root.indexWorkers = nextWorkers
+    worker.running = true
+  }
+
+  function maybeFinishIndexWorker(worker) {
+    if (!worker || worker.completed || !worker.exitFinished || !worker.stdoutFinished) return
+    worker.completed = true
+
+    var nextWorkers = []
+    for (var i = 0; i < root.indexWorkers.length; i++) {
+      if (root.indexWorkers[i] !== worker) nextWorkers.push(root.indexWorkers[i])
+    }
+    root.indexWorkers = nextWorkers
+
+    if (root.opened && !worker.cancelled && worker.sessionSerial === root.sessionSerial) {
+      var output = worker.exitCode === 0 ? worker.output : ""
+      var error = worker.exitCode === 0 ? "" : (worker.errorOutput || "Obsidian CLI command failed")
+      root.finishIndexKind(worker.kind, output, error)
+    }
+    Qt.callLater(function() { worker.destroy() })
+  }
+
+  function finishIndexKind(kind, output, error) {
+    if (kind === "files") {
+      if (error) root.errorText = error
+      root.finishFiles(output)
+    } else if (kind === "aliases") {
+      root.finishAliases(output)
+    } else if (kind === "bookmarks") {
+      root.finishBookmarks(output)
+    } else if (kind === "unresolved") {
+      root.finishUnresolved(output)
+    } else if (kind === "recents") {
+      root.finishRecents(output)
+    }
   }
 
   function cleanField(value) {
@@ -237,35 +299,35 @@ Item {
   }
 
   function finishFiles(output) {
-    if (!root.opened) return
+    if (!root.opened || root.filesLoaded) return
     root.filesOutput = String(output || "")
     root.filesLoaded = true
     root.maybeBuildIndex()
   }
 
   function finishAliases(output) {
-    if (!root.opened) return
+    if (!root.opened || root.aliasesLoaded) return
     root.aliasesOutput = String(output || "")
     root.aliasesLoaded = true
     root.maybeBuildIndex()
   }
 
   function finishBookmarks(output) {
-    if (!root.opened) return
+    if (!root.opened || root.bookmarksLoaded) return
     root.bookmarksOutput = String(output || "")
     root.bookmarksLoaded = true
     root.maybeBuildIndex()
   }
 
   function finishUnresolved(output) {
-    if (!root.opened) return
+    if (!root.opened || root.unresolvedLoaded) return
     root.unresolvedOutput = String(output || "")
     root.unresolvedLoaded = true
     root.maybeBuildIndex()
   }
 
   function finishRecents(output) {
-    if (!root.opened) return
+    if (!root.opened || root.recentsLoaded) return
     root.recentsOutput = String(output || "")
     root.recentsLoaded = true
     root.buildRecentModel()
@@ -325,6 +387,40 @@ Item {
     ].join(root.fieldSeparator))
   }
 
+  function exactSearchKey(value) {
+    return "$" + root.cleanField(value).trim().toLocaleLowerCase()
+  }
+
+  function addExactSearchEntry(index, value, itemIndex) {
+    var cleaned = root.cleanField(value).trim()
+    if (!cleaned) return
+    var key = root.exactSearchKey(cleaned)
+    if (!index[key]) index[key] = []
+    if (index[key].indexOf(itemIndex) < 0) index[key].push(itemIndex)
+  }
+
+  function buildExactSearchIndex(items) {
+    var index = ({})
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i]
+      root.addExactSearchEntry(index, item.title, i)
+      root.addExactSearchEntry(index, item.bookmarkName, i)
+      root.addExactSearchEntry(index, item.createName, i)
+      root.addExactSearchEntry(index, item.path, i)
+      root.addExactSearchEntry(index, root.cleanField(item.path).trim().replace(/\.[^/.]+$/, ""), i)
+
+      var aliases = String(item.aliases || "").split(" · ")
+      for (var j = 0; j < aliases.length; j++)
+        root.addExactSearchEntry(index, aliases[j], i)
+    }
+    return index
+  }
+
+  function exactSearchMatches(query) {
+    var matches = root.exactSearchIndex[root.exactSearchKey(query)]
+    return matches ? matches.slice() : []
+  }
+
   function createableUnresolvedName(value) {
     var name = root.cleanField(value).trim()
     if (!name || /^<%[\s\S]*%>$/.test(name)) return ""
@@ -344,7 +440,8 @@ Item {
   }
 
   function maybeBuildIndex() {
-    if (!root.indexReady || root.errorText) return
+    if (root.indexBuilt || !root.filesLoaded || !root.aliasesLoaded
+        || !root.bookmarksLoaded || !root.unresolvedLoaded) return
 
     var byPath = ({})
     var order = []
@@ -467,7 +564,9 @@ Item {
 
     root.notes = nextNotes
     root.searchItems = searchItems
+    root.exactSearchIndex = root.buildExactSearchIndex(searchItems)
     root.fzfInput = rows.join("\n") + (rows.length ? "\n" : "")
+    root.indexBuilt = true
     if (root.recentsLoaded) root.buildRecentModel()
     // Release the raw command output once the compact in-memory index exists.
     root.filesOutput = ""
@@ -502,11 +601,9 @@ Item {
     pointerGate.reset()
 
     if (!root.filterText) {
-      // Let an in-flight fzf process finish naturally. Stopping it here can
-      // deliver a late empty collector result after the next query starts.
-      // The revision/query guards discard that result, while the old rows
-      // and their current selection stay available until the replacement
-      // search is ready.
+      // Each run owns its output and metadata, so an in-flight query can
+      // finish safely. Its revision guard discards it while recents become
+      // visible immediately.
       root.searchQueued = false
       root.selectedIndex = 0
       root.emptySearchResult = false
@@ -516,102 +613,163 @@ Item {
     }
     // Keep the current batch—including recents on the first query—visible
     // until fzf returns its complete replacement.
-    // Keep the previous model visible until fzf returns the replacement.
-    // QML paints only after applySearchOutput finishes rebuilding the model,
-    // so this also avoids an empty frame during the eventual swap.
-    if (root.indexReady && root.fzfInput) root.requestSearch()
+    if (root.indexReady) root.requestSearch()
   }
 
   function requestSearch() {
     root.searchRevision += 1
-    if (root.searchBusy) {
-      root.searchQueued = true
-      return
-    }
+    root.searchQueued = true
     root.startSearch()
   }
 
   function startSearch() {
-    if (!root.opened || !root.filterText || !root.indexReady || !root.fzfInput) return
+    if (root.activeSearchWorker) return
+    if (!root.opened || !root.filterText || !root.indexReady) {
+      if (!root.filterText) root.searchQueued = false
+      return
+    }
+
+    if (!root.fzfInput) {
+      root.searchQueued = false
+      root.activeSearchQuery = root.filterText
+      root.activeSearchRevision = root.searchRevision
+      root.emptySearchResult = true
+      root.finishSearchProcess()
+      return
+    }
+
     root.searchQueued = false
-    root.searchBusy = true
     root.activeSearchQuery = root.filterText
     root.activeSearchRevision = root.searchRevision
-    searchProc.revision = root.searchRevision
-    searchProc.query = root.filterText
-    searchProc.searchInput = root.fzfInput
-    searchProc.sessionSerial = root.sessionSerial
-    searchProc.collected = ""
-    searchProc.timedOut = false
+
+    var worker = searchWorkerComponent.createObject(root, {
+      revision: root.searchRevision,
+      query: root.filterText,
+      searchInput: root.fzfInput,
+      exactIndexes: root.exactSearchMatches(root.filterText),
+      sessionSerial: root.sessionSerial
+    })
+    if (!worker) {
+      root.searchQueued = false
+      root.errorText = "Unable to start fzf search"
+      return
+    }
+
+    root.activeSearchWorker = worker
+    searchTimeout.worker = worker
     searchTimeout.restart()
-    searchProc.running = true
+    worker.running = true
   }
 
   function finishSearchProcess() {
-    root.searchBusy = false
-    if (!root.searchQueued || !root.filterText) {
-      root.searchQueued = false
-      if (root.filterText && root.emptySearchResult
-          && root.activeSearchRevision === root.searchRevision
-          && root.activeSearchQuery === root.filterText) {
-        var emptyModel = root.activeResultModel === displayModel ? stagingModel : displayModel
-        emptyModel.clear()
-        emptyModel.append({
-          notePath: "",
-          noteTitle: root.filterText,
-          aliases: "",
-          bookmarkName: "",
-          isBookmark: false,
-          createName: root.filterText,
-          fileIcon: root.createIcon
-        })
-        root.activeResultModel = emptyModel
-        root.emptySearchResult = false
-        root.selectedIndex = 0
-        root.cursorActive = true
-        Qt.callLater(function() { resultList.positionViewAtIndex(0, ListView.Beginning) })
-      }
+    if (root.searchQueued && root.filterText) {
+      Qt.callLater(function() { root.startSearch() })
       return
     }
+
     root.searchQueued = false
-    Qt.callLater(function() { root.startSearch() })
+    if (root.filterText && root.emptySearchResult
+        && root.activeSearchRevision === root.searchRevision
+        && root.activeSearchQuery === root.filterText) {
+      var emptyModel = root.activeResultModel === displayModel ? stagingModel : displayModel
+      emptyModel.clear()
+      emptyModel.append({
+        notePath: "",
+        noteTitle: root.filterText,
+        aliases: "",
+        bookmarkName: "",
+        isBookmark: false,
+        createName: root.filterText,
+        fileIcon: root.createIcon
+      })
+      root.activeResultModel = emptyModel
+      root.emptySearchResult = false
+      root.selectedIndex = 0
+      root.cursorActive = true
+      Qt.callLater(function() { resultList.positionViewAtIndex(0, ListView.Beginning) })
+    }
   }
 
-  function isExactSearchMatch(item, query) {
-    var needle = root.cleanField(query).trim().toLocaleLowerCase()
-    if (!needle) return false
-
-    function equals(value) {
-      return root.cleanField(value).trim().toLocaleLowerCase() === needle
-    }
-
-    if (equals(item.title) || equals(item.bookmarkName) || equals(item.createName)) return true
-    if (equals(item.path)) return true
-
-    var pathWithoutExtension = root.cleanField(item.path).trim().replace(/\.[^/.]+$/, "")
-    if (equals(pathWithoutExtension)) return true
-
-    var aliases = String(item.aliases || "").split(" · ")
-    for (var i = 0; i < aliases.length; i++) {
-      if (equals(aliases[i])) return true
-    }
-    return false
+  function maybeFinishSearchWorker(worker) {
+    if (!worker || worker.completed || !worker.exitFinished || !worker.stdoutFinished) return
+    root.completeSearchWorker(worker)
   }
 
-  function applySearchOutput(revision, query, output) {
+  function completeSearchWorker(worker) {
+    if (!worker || worker.completed) return
+    worker.completed = true
+
+    if (searchTimeout.worker === worker) {
+      searchTimeout.stop()
+      searchTimeout.worker = null
+    }
+    if (searchKillTimeout.worker === worker) {
+      searchKillTimeout.stop()
+      searchKillTimeout.worker = null
+    }
+
+    var isCurrent = root.activeSearchWorker === worker
+    if (isCurrent) root.activeSearchWorker = null
+
+    try {
+      if (isCurrent && root.opened && !worker.cancelled
+          && worker.sessionSerial === root.sessionSerial) {
+        if (worker.timedOut) {
+          root.searchQueued = !!root.filterText
+        } else {
+          root.applySearchOutput(worker.revision, worker.query, worker.exactIndexes, worker.collected)
+          if (worker.exitCode === 0 || worker.exitCode === 1) root.errorText = ""
+          if (worker.exitCode !== 0 && worker.exitCode !== 1
+              && worker.revision === root.searchRevision) {
+            root.errorText = worker.errorOutput || "fzf search failed"
+          }
+        }
+      }
+    } catch (error) {
+      if (isCurrent && root.opened) {
+        root.errorText = "Unable to process fzf results"
+        root.searchQueued = false
+      }
+      console.warn("Obsidian quick switcher search completion failed:", error)
+    } finally {
+      if (isCurrent) root.finishSearchProcess()
+      Qt.callLater(function() { worker.destroy() })
+    }
+  }
+
+  function abandonSearchWorker(worker) {
+    if (!worker || root.activeSearchWorker !== worker) return
+    if (searchTimeout.worker === worker) {
+      searchTimeout.stop()
+      searchTimeout.worker = null
+    }
+    if (searchKillTimeout.worker === worker) {
+      searchKillTimeout.stop()
+      searchKillTimeout.worker = null
+    }
+
+    root.activeSearchWorker = null
+    worker.cancelled = true
+    worker.completed = true
+    if (worker.running) worker.signal(9)
+    Qt.callLater(function() { worker.destroy() })
+
+    root.searchQueued = !!root.filterText
+    if (root.searchQueued) Qt.callLater(function() { root.startSearch() })
+  }
+
+  function applySearchOutput(revision, query, exactIndexes, output) {
     if (!root.opened || revision !== root.searchRevision || query !== root.filterText) return
 
-    var exactRows = []
-    var regularRows = []
-    var lines = String(output || "").split("\n")
-    for (var i = 0; i < lines.length; i++) {
-      if (!lines[i]) continue
-      var separator = lines[i].indexOf(root.fieldSeparator)
-      var indexText = separator >= 0 ? lines[i].substring(0, separator) : lines[i]
-      var itemIndex = Number(indexText)
-      if (!Number.isInteger(itemIndex) || itemIndex < 0 || itemIndex >= root.searchItems.length) continue
+    var nextRows = []
+    var seen = ({})
+
+    function appendItem(itemIndex) {
+      if (!Number.isInteger(itemIndex) || itemIndex < 0
+          || itemIndex >= root.searchItems.length || seen[itemIndex]) return
+      seen[itemIndex] = true
       var item = root.searchItems[itemIndex]
-      var row = {
+      nextRows.push({
         notePath: item.path,
         noteTitle: item.title,
         aliases: item.aliases,
@@ -619,12 +777,21 @@ Item {
         isBookmark: item.isBookmark,
         createName: item.createName,
         fileIcon: item.fileIcon
-      }
-      if (root.isExactSearchMatch(item, query)) exactRows.push(row)
-      else regularRows.push(row)
+      })
     }
 
-    var nextRows = exactRows.concat(regularRows)
+    var exact = exactIndexes || []
+    for (var exactIndex = 0; exactIndex < exact.length; exactIndex++)
+      appendItem(Number(exact[exactIndex]))
+
+    var lines = String(output || "").split("\n")
+    for (var i = 0; i < lines.length && nextRows.length < 50; i++) {
+      if (!lines[i]) continue
+      var separator = lines[i].indexOf(root.fieldSeparator)
+      var indexText = separator >= 0 ? lines[i].substring(0, separator) : lines[i]
+      appendItem(Number(indexText))
+    }
+
     if (nextRows.length > 50) nextRows = nextRows.slice(0, 50)
 
     if (nextRows.length === 0) {
@@ -713,15 +880,34 @@ Item {
       var token = tokens[t]
       var cursor = 0
       var positions = []
+      var complete = true
       for (var i = 0; i < token.length; i++) {
         var found = lower.indexOf(token.charAt(i), cursor)
         if (found < 0) {
-          positions = []
+          complete = false
           break
         }
         positions.push(found)
         cursor = found + 1
       }
+
+      if (!complete) {
+        // fzf may match the query in another field (for example a path or
+        // alias), while this visible field contains the same letters in a
+        // different order. Mark the available characters instead of
+        // dropping the whole highlight for this field.
+        positions = []
+        var used = []
+        for (var fallbackIndex = 0; fallbackIndex < token.length; fallbackIndex++) {
+          var fallbackFound = lower.indexOf(token.charAt(fallbackIndex))
+          while (fallbackFound >= 0 && used.indexOf(fallbackFound) >= 0)
+            fallbackFound = lower.indexOf(token.charAt(fallbackIndex), fallbackFound + 1)
+          if (fallbackFound < 0) continue
+          used.push(fallbackFound)
+          positions.push(fallbackFound)
+        }
+      }
+
       for (var p = 0; p < positions.length; p++) marked[positions[p]] = true
     }
 
@@ -747,140 +933,133 @@ Item {
     referenceItem: card
   }
 
-  Process {
-    id: filesProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.finishFiles(text)
-    }
-    stderr: StdioCollector { id: filesErrorCollector; waitForEnd: true }
-    onExited: function(exitCode) {
-      if (!root.opened || root.stoppingProcesses || exitCode === 0) return
-      root.errorText = String(filesErrorCollector.text || "").trim() || "Unable to load files from Obsidian"
-      root.filesLoaded = true
-    }
-  }
+  Component {
+    id: indexWorkerComponent
 
-  Process {
-    id: aliasesProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.finishAliases(text)
-    }
-    onExited: function(exitCode) {
-      // File search remains useful if aliases are unavailable.
-      if (root.opened && !root.stoppingProcesses && exitCode !== 0 && !root.aliasesLoaded) root.finishAliases("")
-    }
-  }
+    Process {
+      id: indexWorker
+      required property string kind
+      required property int sessionSerial
+      property string output: ""
+      property string errorOutput: ""
+      property int exitCode: -1
+      property bool exitFinished: false
+      property bool stdoutFinished: false
+      property bool cancelled: false
+      property bool completed: false
 
-  Process {
-    id: recentProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.finishRecents(text)
-    }
-    stderr: StdioCollector { id: recentErrorCollector; waitForEnd: true }
-    onExited: function(exitCode) {
-      if (root.opened && !root.stoppingProcesses && exitCode !== 0 && !root.recentsLoaded)
-        root.finishRecents("")
-    }
-  }
-
-  Process {
-    id: bookmarksProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.finishBookmarks(text)
-    }
-    stderr: StdioCollector { id: bookmarksErrorCollector; waitForEnd: true }
-    onExited: function(exitCode) {
-      if (root.opened && !root.stoppingProcesses && exitCode !== 0 && !root.bookmarksLoaded)
-        root.finishBookmarks("")
-    }
-  }
-
-  Process {
-    id: unresolvedProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.finishUnresolved(text)
-    }
-    stderr: StdioCollector { id: unresolvedErrorCollector; waitForEnd: true }
-    onExited: function(exitCode) {
-      // Unresolved links are an enhancement; an unavailable command should
-      // not prevent ordinary file search from becoming ready.
-      if (root.opened && !root.stoppingProcesses && exitCode !== 0 && !root.unresolvedLoaded)
-        root.finishUnresolved("")
-    }
-  }
-
-  Process {
-    id: searchProc
-    stdinEnabled: true
-    property int revision: 0
-    property string query: ""
-    property string searchInput: ""
-    property int sessionSerial: 0
-    property string collected: ""
-    property bool timedOut: false
-
-    stdout: SplitParser {
-      onRead: function(data) { searchProc.collected += data + "\n" }
-    }
-    stderr: StdioCollector { id: searchErrorCollector; waitForEnd: true }
-    command: ["bash", "-c", root.fzfCommand]
-    onStarted: write(searchProc.query + "\n" + searchProc.searchInput + root.inputSentinel + "\n")
-    onExited: function(exitCode) {
-      root.searchTimeout.stop()
-      if (!root.opened || root.stoppingProcesses || searchProc.sessionSerial !== root.sessionSerial) return
-
-      if (searchProc.timedOut) {
-        searchProc.timedOut = false
-        root.searchBusy = false
-        if (root.filterText) {
-          root.searchQueued = false
-          Qt.callLater(function() { root.startSearch() })
-        } else {
-          root.searchQueued = false
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: {
+          indexWorker.output = text
+          indexWorker.stdoutFinished = true
+          root.maybeFinishIndexWorker(indexWorker)
         }
-        return
+      }
+      stderr: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: indexWorker.errorOutput = String(text || "").trim()
+      }
+      onExited: function(code) {
+        indexWorker.exitCode = code
+        indexWorker.exitFinished = true
+        root.maybeFinishIndexWorker(indexWorker)
+      }
+    }
+  }
+
+  Component {
+    id: searchWorkerComponent
+
+    Process {
+      id: worker
+      required property int revision
+      required property string query
+      required property string searchInput
+      required property var exactIndexes
+      required property int sessionSerial
+      property string collected: ""
+      property string errorOutput: ""
+      property int exitCode: -1
+      property bool exitFinished: false
+      property bool stdoutFinished: false
+      property bool timedOut: false
+      property bool cancelled: false
+      property bool completed: false
+      property bool forceKilled: false
+
+      stdinEnabled: true
+      command: ["bash", "-c", root.fzfCommand]
+
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: {
+          worker.collected = text
+          worker.stdoutFinished = true
+          root.maybeFinishSearchWorker(worker)
+        }
+      }
+      stderr: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: worker.errorOutput = String(text || "").trim()
       }
 
-      var completedRevision = searchProc.revision
-      var completedQuery = searchProc.query
-      var completedOutput = searchProc.collected
-      root.applySearchOutput(completedRevision, completedQuery, completedOutput)
-      root.finishSearchProcess()
-      if (exitCode !== 0 && exitCode !== 1
-          && completedRevision === root.searchRevision) {
-        root.errorText = String(searchErrorCollector.text || "").trim() || "fzf search failed"
+      onStarted: {
+        if (worker.cancelled) {
+          worker.running = false
+          return
+        }
+        worker.write(worker.query + "\n" + worker.searchInput + root.inputSentinel + "\n")
+      }
+      onExited: function(code) {
+        worker.exitCode = code
+        worker.exitFinished = true
+        root.maybeFinishSearchWorker(worker)
       }
     }
   }
 
   Timer {
     id: searchTimeout
+    property var worker: null
     interval: root.searchTimeoutMs
     repeat: false
     onTriggered: {
-      if (!root.searchBusy) return
+      var candidate = searchTimeout.worker
+      searchTimeout.worker = null
+      if (!candidate || root.activeSearchWorker !== candidate) return
 
-      searchProc.timedOut = true
-      if (searchProc.running) {
-        searchProc.running = false
+      candidate.timedOut = true
+      root.searchQueued = !!root.filterText
+      if (candidate.running) {
+        candidate.running = false
+        searchKillTimeout.worker = candidate
+        searchKillTimeout.restart()
+        return
+      }
+      root.abandonSearchWorker(candidate)
+    }
+  }
+
+  Timer {
+    id: searchKillTimeout
+    property var worker: null
+    interval: 500
+    repeat: false
+    onTriggered: {
+      var candidate = searchKillTimeout.worker
+      if (!candidate || root.activeSearchWorker !== candidate) {
+        searchKillTimeout.worker = null
         return
       }
 
-      // A Process can fail before it reaches onStarted. Recover even when
-      // that failure does not produce an onExited callback.
-      searchProc.timedOut = false
-      root.searchBusy = false
-      if (root.filterText) {
-        root.searchQueued = false
-        Qt.callLater(function() { root.startSearch() })
-      } else {
-        root.searchQueued = false
+      if (candidate.running && !candidate.forceKilled) {
+        candidate.forceKilled = true
+        candidate.signal(9)
+        searchKillTimeout.restart()
+        return
       }
+      root.abandonSearchWorker(candidate)
     }
   }
 
