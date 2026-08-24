@@ -476,12 +476,16 @@ Item {
 
   function iconForPath(path) {
     var lower = String(path || "").toLocaleLowerCase()
-    if (/\.md$/.test(lower)) return "󰍔"
+    if (/\.md$/.test(lower)) return "󰈔"
+    if (/\.html?$/.test(lower)) return "󰌝"
+    if (/\.css$/.test(lower)) return "󰌜"
+    if (/\.(js|mjs|cjs|ts|tsx)$/.test(lower)) return "󰌞"
+    if (/\.py$/.test(lower)) return "󰌠"
     if (/\.(png|jpe?g|gif|webp|svg|avif)$/.test(lower)) return "󰋩"
     if (/\.pdf$/.test(lower)) return "󰈦"
     if (/\.(mp3|wav|flac|m4a|ogg)$/.test(lower)) return "󰎆"
     if (/\.(mp4|mkv|mov|webm)$/.test(lower)) return "󰕧"
-    return "󰈔"
+    return "󰈙"
   }
 
   function setFilter(nextFilter) {
