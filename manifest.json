@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "mk.obsidian-quick-switcher",
+  "name": "Obsidian Quick Switcher",
+  "version": "1.1.1",
+  "author": "Mateusz Kowalczyk",
+  "description": "A native Omarchy overlay for fuzzy-searching Obsidian notes and aliases",
+  "license": "MIT",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "QuickSwitcher.qml"
+  }
+}
