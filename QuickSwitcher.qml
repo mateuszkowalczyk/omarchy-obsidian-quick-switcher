@@ -22,6 +22,7 @@ Item {
   property int sessionSerial: 0
   property bool emptySearchResult: false
   property bool recentsLoaded: false
+  property string cliStatus: "unknown"
   property string filterText: ""
   property string vault: ""
   property string filesOutput: ""
@@ -45,6 +46,9 @@ Item {
 
   readonly property bool indexReady: indexBuilt
   readonly property bool recentsReady: recentsLoaded && filesLoaded
+  readonly property bool cliDisabled: cliStatus === "disabled"
+  readonly property string cliDisabledMessage:
+    "Obsidian CLI is not enabled. Enable it in Settings → General → Advanced."
   readonly property bool showResults: opened
 
   property color background: Color.menu.background
@@ -87,12 +91,19 @@ Item {
   readonly property string fzfCommand:
     "fzf --filter=\"$1\" --delimiter=$'\\037' --nth=2.. "
     + "--tiebreak=begin,length,index --no-multi | head -n 50"
+  readonly property string obsidianReadyProbe:
+    "if ! command -v obsidian >/dev/null 2>&1; then "
+    + "echo 'Obsidian CLI is not available' >&2; exit 127; fi; "
+    + "probe_output=$(timeout 1 obsidian files total \"${vault_args[@]}\" 2>&1); "
+    + "count=$(printf '%s' \"$probe_output\" | tr -d '[:space:]'); "
+    + "if printf '%s' \"$probe_output\" | grep -qi 'command line interface is not enabled'; then "
+    + "echo 'Obsidian CLI is not enabled' >&2; exit 2; fi; "
   readonly property string obsidianIndexCommand:
     "vault_args=(); "
     + "[[ -n $1 ]] && vault_args=(\"vault=$1\"); "
     + "sleep 0.3; "
     + "for ((attempt = 0; attempt < 12; attempt++)); do "
-    + "count=$(timeout 1 obsidian files total \"${vault_args[@]}\" 2>/dev/null | tr -d '[:space:]'); "
+    + root.obsidianReadyProbe
     + "if [[ $count =~ ^[0-9]+$ ]]; then "
     + "if [[ $2 == files ]]; then exec obsidian files \"${vault_args[@]}\"; "
     + "elif [[ $2 == unresolved ]]; then exec obsidian unresolved verbose format=json \"${vault_args[@]}\"; "
@@ -106,7 +117,7 @@ Item {
     + "[[ -n $1 ]] && vault_args=(\"vault=$1\"); "
     + "sleep 0.3; "
     + "for ((attempt = 0; attempt < 12; attempt++)); do "
-    + "count=$(timeout 1 obsidian files total \"${vault_args[@]}\" 2>/dev/null | tr -d '[:space:]'); "
+    + root.obsidianReadyProbe
     + "if [[ $count =~ ^[0-9]+$ ]]; then exec obsidian recents \"${vault_args[@]}\"; fi; "
     + "sleep 0.25; "
     + "done; "
@@ -116,7 +127,7 @@ Item {
     + "[[ -n $1 ]] && vault_args=(\"vault=$1\"); "
     + "sleep 0.3; "
     + "for ((attempt = 0; attempt < 12; attempt++)); do "
-    + "count=$(timeout 1 obsidian bookmarks total \"${vault_args[@]}\" 2>/dev/null | tr -d '[:space:]'); "
+    + root.obsidianReadyProbe
     + "if [[ $count =~ ^[0-9]+$ ]]; then exec obsidian bookmarks verbose \"${vault_args[@]}\"; fi; "
     + "sleep 0.25; "
     + "done; "
@@ -182,6 +193,7 @@ Item {
     root.indexWorkers = []
     root.bookmarksLoaded = false
     root.recentsLoaded = false
+    root.cliStatus = "unknown"
     root.activeResultModel = recentModel
     displayModel.clear()
     stagingModel.clear()
@@ -269,14 +281,24 @@ Item {
     if (root.opened && !worker.cancelled && worker.sessionSerial === root.sessionSerial) {
       var output = worker.exitCode === 0 ? worker.output : ""
       var error = worker.exitCode === 0 ? "" : (worker.errorOutput || "Obsidian CLI command failed")
+      if (worker.exitCode === 2) error = "Obsidian CLI is not enabled"
+      if (worker.exitCode === 127) error = "Obsidian CLI is not available"
       root.finishIndexKind(worker.kind, output, error)
     }
     Qt.callLater(function() { worker.destroy() })
   }
 
   function finishIndexKind(kind, output, error) {
+    if (error && /command line interface is not enabled|obsidian cli is not available|command not found/i.test(String(error))) {
+      root.cliStatus = "disabled"
+      root.errorText = ""
+    } else if (!error && root.cliStatus === "unknown") {
+      root.cliStatus = "available"
+    } else if (error && kind === "files") {
+      root.errorText = error
+    }
+
     if (kind === "files") {
-      if (error) root.errorText = error
       root.finishFiles(output)
     } else if (kind === "aliases") {
       root.finishAliases(output)
@@ -1304,9 +1326,11 @@ Item {
             anchors.centerIn: parent
             width: parent.width - Style.space(24)
             visible: !root.activeResultModel || root.activeResultModel.count === 0
-            text: root.filterText
-              ? (root.errorText || (!root.indexReady ? "Loading files, aliases, bookmarks, and links…" : "No matching files"))
-              : (!root.recentsReady ? "Loading recent notes…" : "No recent notes")
+            text: root.cliDisabled
+              ? root.cliDisabledMessage
+              : (root.filterText
+                ? (root.errorText || (!root.indexReady ? "Loading files, aliases, bookmarks, and links…" : "No matching files"))
+                : (root.errorText || (!root.recentsReady ? "Loading recent notes…" : "No recent notes")))
             color: root.foreground
             opacity: 0.58
             font.family: root.fontFamily
