@@ -25,9 +25,14 @@ omarchy plugin add https://github.com/mateuszkowalczyk/omarchy-obsidian-quick-sw
 
 ### Enable the Obsidian CLI
 
+The switcher uses the CLI to find and open files in your vault.
+
 In Obsidian, go to **Settings → General → Advanced** and turn on **Command line
-interface**. The switcher uses the CLI to find and open files in
-your vault.
+interface**.
+
+When Obsidian asks you to "Set up CLI to work in the terminal," select **Skip**.
+Omarchy's default Obsidian installation uses the Electron version, so this setup
+isn't supported or needed.
 
 ## Binding
 
