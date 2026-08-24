@@ -21,11 +21,13 @@ stderr_file=$capture_dir/stderr
 stdout_reader=
 stderr_reader=
 command_pid=
+reader_watchdog=
 
 cleanup() {
   [[ -n $command_pid ]] && kill "$command_pid" 2>/dev/null || true
   [[ -n $stdout_reader ]] && kill "$stdout_reader" 2>/dev/null || true
   [[ -n $stderr_reader ]] && kill "$stderr_reader" 2>/dev/null || true
+  [[ -n $reader_watchdog ]] && kill "$reader_watchdog" 2>/dev/null || true
   rm -f -- "$stdout_pipe" "$stderr_pipe" "$stdout_file" "$stderr_file"
   rmdir -- "$capture_dir" 2>/dev/null || true
 }
@@ -46,8 +48,20 @@ command_pid=$!
 wait "$command_pid"
 command_status=$?
 command_pid=
+
+# A detached descendant may inherit a capture pipe after the owned command
+# exits. Give normal buffered output a short drain window, then retire the
+# readers so an inherited descriptor cannot hold this wrapper indefinitely.
+(
+  sleep 1
+  kill "$stdout_reader" "$stderr_reader" 2>/dev/null || true
+) &
+reader_watchdog=$!
 wait "$stdout_reader" 2>/dev/null || true
 wait "$stderr_reader" 2>/dev/null || true
+kill "$reader_watchdog" 2>/dev/null || true
+wait "$reader_watchdog" 2>/dev/null || true
+reader_watchdog=
 stdout_reader=
 stderr_reader=
 

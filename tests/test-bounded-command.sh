@@ -33,6 +33,9 @@ check_status 74 $? "rejects stderr overflow"
 $helper 5 5 test bash -c "printf err >&2; exit 7" >/dev/null 2>/dev/null
 check_status 7 $? "preserves command failure status"
 
+timeout 3 "$helper" 5 5 test bash -c "sleep 4 &" >/dev/null 2>/dev/null
+check_status 0 $? "does not wait indefinitely for an inherited output pipe"
+
 if (( failures > 0 )); then
   exit 1
 fi

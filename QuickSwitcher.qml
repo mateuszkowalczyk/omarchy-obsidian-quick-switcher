@@ -4,6 +4,7 @@ import Quickshell.Wayland
 import QtQuick
 import qs.Commons
 import qs.Ui
+import "IndexBuilder.js" as IndexBuilder
 
 Item {
   id: root
@@ -12,41 +13,32 @@ Item {
   property var manifest: null
 
   property bool opened: false
-  property bool filesLoaded: false
-  property bool aliasesLoaded: false
-  property bool bookmarksLoaded: false
-  property bool unresolvedLoaded: false
   property bool indexBuilt: false
   property bool indexFailed: false
+  property bool refreshing: false
   property bool cursorActive: false
   property var activeSearchWorker: null
   property int sessionSerial: 0
   property bool emptySearchResult: false
-  property bool recentsLoaded: false
   property string cliStatus: "unknown"
   property string filterText: ""
-  property string vault: ""
-  property string filesOutput: ""
-  property string aliasesOutput: ""
-  property string bookmarksOutput: ""
-  property string unresolvedOutput: ""
-  property string recentsOutput: ""
+  property var indexOutputs: ({})
   property string fzfInput: ""
   property string errorText: ""
   property string activeSearchQuery: ""
   property int searchRevision: 0
   property int activeSearchRevision: 0
   property int selectedIndex: 0
-  property var notesByPath: ({})
-  property var filePaths: []
-  property var existingPathIndex: ({})
   property var searchItems: []
   property var exactSearchIndex: ({})
   property var indexWorkers: []
+  property var indexQueue: []
+  property int indexSerial: 0
+  property var indexBuildJob: null
   property var activeResultModel: displayModel
 
   readonly property bool indexReady: indexBuilt
-  readonly property bool recentsReady: recentsLoaded && filesLoaded
+  readonly property bool recentsReady: indexBuilt
   readonly property bool cliDisabled: cliStatus === "disabled"
   readonly property string cliDisabledMessage:
     "Obsidian CLI is not enabled. Enable it in Settings → General → Advanced."
@@ -76,6 +68,10 @@ Item {
   property int rowSpacing: Style.spacing.xs
   property int rowPeek: Math.round(rowHeight * 0.55)
   readonly property int searchTimeoutMs: 3000
+  readonly property int indexCommandTimeoutSeconds: 10
+  readonly property int maxIndexAttempts: 2
+  readonly property int maxConcurrentIndexWorkers: 2
+  readonly property int indexBuildChunkMs: 4
   readonly property int maxFiles: 50000
   readonly property int maxAliases: 100000
   readonly property int maxAliasesPerFile: 64
@@ -114,54 +110,21 @@ Item {
   readonly property string obsidianReadyProbe:
     "if ! command -v obsidian >/dev/null 2>&1; then "
     + "echo 'Obsidian CLI is not available' >&2; exit 127; fi; "
-    + "probe_output=$(timeout 1 obsidian files total \"${vault_args[@]}\" 2>&1 | head -c 4097); "
+    + "probe_output=$(timeout 1 obsidian files total 2>&1 | head -c 4097); "
     + "count=$(printf '%s' \"$probe_output\" | tr -d '[:space:]'); "
     + "if printf '%s' \"$probe_output\" | grep -qi 'command line interface is not enabled'; then "
     + "echo 'Obsidian CLI is not enabled' >&2; exit 2; fi; "
-  readonly property string obsidianIndexCommand:
-    "vault_args=(); "
-    + "[[ -n $1 ]] && vault_args=(\"vault=$1\"); "
-    + "sleep 0.3; "
+  readonly property string obsidianReadinessCommand:
+    "sleep 0.3; "
     + "for ((attempt = 0; attempt < 12; attempt++)); do "
     + root.obsidianReadyProbe
-    + "if [[ $count =~ ^[0-9]+$ ]]; then "
-    + "if [[ $2 == files ]]; then exec obsidian files \"${vault_args[@]}\"; "
-    + "elif [[ $2 == unresolved ]]; then exec obsidian unresolved verbose format=json \"${vault_args[@]}\"; "
-    + "else exec obsidian aliases verbose \"${vault_args[@]}\"; fi; "
-    + "fi; "
-    + "sleep 0.25; "
-    + "done; "
-      + "echo 'Obsidian CLI did not become ready within 15 seconds' >&2; exit 1"
-  readonly property string obsidianRecentsCommand:
-    "vault_args=(); "
-    + "[[ -n $1 ]] && vault_args=(\"vault=$1\"); "
-    + "sleep 0.3; "
-    + "for ((attempt = 0; attempt < 12; attempt++)); do "
-    + root.obsidianReadyProbe
-    + "if [[ $count =~ ^[0-9]+$ ]]; then exec obsidian recents \"${vault_args[@]}\"; fi; "
-    + "sleep 0.25; "
-    + "done; "
-    + "echo 'Obsidian CLI did not become ready within 15 seconds' >&2; exit 1"
-  readonly property string obsidianBookmarksCommand:
-    "vault_args=(); "
-    + "[[ -n $1 ]] && vault_args=(\"vault=$1\"); "
-    + "sleep 0.3; "
-    + "for ((attempt = 0; attempt < 12; attempt++)); do "
-    + root.obsidianReadyProbe
-    + "if [[ $count =~ ^[0-9]+$ ]]; then exec obsidian bookmarks verbose \"${vault_args[@]}\"; fi; "
+    + "if [[ $count =~ ^[0-9]+$ ]]; then exit 0; fi; "
     + "sleep 0.25; "
     + "done; "
     + "echo 'Obsidian CLI did not become ready within 15 seconds' >&2; exit 1"
 
-  function open(payloadJson) {
-    var payload = {}
-    if (payloadJson) {
-      try { payload = JSON.parse(payloadJson) || {} } catch (e) { payload = {} }
-    }
-
-    root.stopProcesses()
+  function open() {
     root.clearSession()
-    root.vault = String(payload.vault || "")
     root.opened = true
     root.startIndexLoad()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -169,7 +132,6 @@ Item {
 
   function close() {
     root.opened = false
-    root.stopProcesses()
     root.clearSession()
   }
 
@@ -182,65 +144,25 @@ Item {
 
   function clearSession() {
     root.sessionSerial += 1
+    var worker = root.activeSearchWorker
+    root.activeSearchWorker = null
     searchTimeout.stop()
     searchTimeout.worker = null
     searchKillTimeout.stop()
     searchKillTimeout.worker = null
-    root.filesLoaded = false
-    root.aliasesLoaded = false
-    root.unresolvedLoaded = false
-    root.indexBuilt = false
-    root.indexFailed = false
     root.cursorActive = false
-    root.activeSearchWorker = null
     root.emptySearchResult = false
     root.filterText = ""
-    root.filesOutput = ""
-    root.aliasesOutput = ""
-    root.bookmarksOutput = ""
-    root.unresolvedOutput = ""
-    root.recentsOutput = ""
-    root.fzfInput = ""
     root.errorText = ""
     root.activeSearchQuery = ""
     root.searchRevision = 0
     root.activeSearchRevision = 0
     root.selectedIndex = 0
-    root.notesByPath = ({})
-    root.filePaths = []
-    root.existingPathIndex = ({})
-    root.searchItems = []
-    root.exactSearchIndex = ({})
-    root.indexWorkers = []
-    root.bookmarksLoaded = false
-    root.recentsLoaded = false
-    root.cliStatus = "unknown"
     root.activeResultModel = recentModel
     displayModel.clear()
     stagingModel.clear()
-    recentModel.clear()
+    root.cursorActive = recentModel.count > 0
     pointerGate.reset()
-  }
-
-  function stopProcesses() {
-    searchTimeout.stop()
-    searchTimeout.worker = null
-    searchKillTimeout.stop()
-    searchKillTimeout.worker = null
-    var indexWorkerList = root.indexWorkers
-    root.indexWorkers = []
-    for (var i = 0; i < indexWorkerList.length; i++) {
-      var indexWorker = indexWorkerList[i]
-      if (!indexWorker) continue
-      indexWorker.cancelled = true
-      indexWorker.completed = true
-      if (indexWorker.running) indexWorker.running = false
-      Qt.callLater((function(workerToDestroy) {
-        return function() { workerToDestroy.destroy() }
-      })(indexWorker))
-    }
-    var worker = root.activeSearchWorker
-    root.activeSearchWorker = null
     if (worker) {
       worker.cancelled = true
       worker.completed = true
@@ -250,10 +172,13 @@ Item {
   }
 
   function startIndexLoad() {
-    root.filesLoaded = false
-    root.aliasesLoaded = false
-    root.bookmarksLoaded = false
-    root.unresolvedLoaded = false
+    if (root.refreshing) return
+    root.refreshing = true
+    root.indexFailed = false
+    root.cliStatus = "unknown"
+    root.indexSerial += 1
+    root.indexOutputs = ({})
+    root.indexBuildJob = null
     // A first CLI call can turn into the long-running Electron app when
     // Obsidian is closed. Launch that app detached first, then let the owned
     // scan processes poll its command server. The bracketed pgrep pattern
@@ -263,34 +188,59 @@ Item {
       "pgrep -f '[o]bsidian/app.asar' >/dev/null || exec obsidian"
     ])
 
-    // Poll a numeric file count before the real scans. Each probe is bounded
-    // because a startup race must not turn a scan process into the app. Empty
-    // vaults remain valid because zero is a numeric readiness response.
-    root.startIndexWorker("files", root.maxFilesOutputBytes,
-      ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "files"])
-    root.startIndexWorker("aliases", root.maxAliasesOutputBytes,
-      ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "aliases"])
-    root.startIndexWorker("unresolved", root.maxUnresolvedOutputBytes,
-      ["bash", "-c", root.obsidianIndexCommand, "obsidian-quick-switcher", root.vault, "unresolved"])
-    root.startIndexWorker("recents", root.maxRecentsOutputBytes,
-      ["bash", "-c", root.obsidianRecentsCommand, "obsidian-quick-switcher", root.vault])
-    root.startIndexWorker("bookmarks", root.maxBookmarksOutputBytes,
-      ["bash", "-c", root.obsidianBookmarksCommand, "obsidian-quick-switcher", root.vault])
+    // Probe readiness once, then use limited concurrency. Five simultaneous
+    // requests proved unreliable, while two preserve most of the speedup.
+    // Files and recents go first so the initial list appears quickly.
+    root.indexQueue = [
+      { kind: "files", outputLimit: root.maxFilesOutputBytes,
+        command: root.obsidianCommand(["files"]) },
+      { kind: "recents", outputLimit: root.maxRecentsOutputBytes,
+        command: root.obsidianCommand(["recents"]) },
+      { kind: "aliases", outputLimit: root.maxAliasesOutputBytes,
+        command: root.obsidianCommand(["aliases", "verbose"]) },
+      { kind: "bookmarks", outputLimit: root.maxBookmarksOutputBytes,
+        command: root.obsidianCommand(["bookmarks", "verbose"]) },
+      { kind: "unresolved", outputLimit: root.maxUnresolvedOutputBytes,
+        command: root.obsidianCommand(["unresolved", "verbose", "format=json"]) }
+    ]
+    root.startIndexWorker("readiness", 4096,
+      ["bash", "-c", root.obsidianReadinessCommand], 1)
   }
 
-  function startIndexWorker(kind, outputLimit, command) {
+  function obsidianCommand(args) {
+    return ["timeout", "--signal=TERM", "--kill-after=1s",
+      root.indexCommandTimeoutSeconds + "s", "obsidian"].concat(args)
+  }
+
+  function startNextIndexWorker() {
+    if (!root.refreshing || root.indexFailed || root.cliDisabled) return
+    while (root.refreshing && !root.indexFailed && !root.cliDisabled
+        && root.indexWorkers.length < root.maxConcurrentIndexWorkers
+        && root.indexQueue.length > 0) {
+      var queue = root.indexQueue.slice()
+      var next = queue.shift()
+      root.indexQueue = queue
+      root.startIndexWorker(next.kind, next.outputLimit, next.command, next.attempt || 1)
+    }
+  }
+
+  function startIndexWorker(kind, outputLimit, command, attempt) {
     var worker = indexWorkerComponent.createObject(root, {
       kind: kind,
-      sessionSerial: root.sessionSerial,
+      sessionSerial: root.indexSerial,
+      outputLimit: outputLimit,
+      originalCommand: command,
+      attempt: attempt,
       command: [root.boundedCommandPath, String(outputLimit), String(root.maxStderrBytes), kind].concat(command)
     })
     if (!worker) {
-      root.finishIndexKind(kind, "", "Unable to start Obsidian CLI")
+      root.failIndex("Unable to start Obsidian CLI " + kind + " worker")
       return
     }
     var nextWorkers = root.indexWorkers.slice()
     nextWorkers.push(worker)
     root.indexWorkers = nextWorkers
+    worker.launchRequested = true
     worker.running = true
   }
 
@@ -298,21 +248,90 @@ Item {
     if (!worker || worker.completed || !worker.exitFinished || !worker.stdoutFinished) return
     worker.completed = true
 
+    var kind = worker.kind
+    var session = worker.sessionSerial
+    var outputLimit = worker.outputLimit
+    var originalCommand = worker.originalCommand
+    var attempt = worker.attempt
+    var exitCode = worker.exitCode
+    var output = worker.output
+    var errorOutput = worker.errorOutput
+    var current = root.refreshing && !worker.cancelled && session === root.indexSerial
+
     var nextWorkers = []
     for (var i = 0; i < root.indexWorkers.length; i++) {
       if (root.indexWorkers[i] !== worker) nextWorkers.push(root.indexWorkers[i])
     }
     root.indexWorkers = nextWorkers
 
-    if (root.opened && !worker.cancelled && worker.sessionSerial === root.sessionSerial) {
-      var output = worker.exitCode === 0 ? worker.output : ""
-      var error = worker.exitCode === 0 ? "" : (worker.errorOutput || "Obsidian CLI command failed")
-      if (worker.exitCode === 2) error = "Obsidian CLI is not enabled"
-      if (worker.exitCode === 127) error = "Obsidian CLI is not available"
-      if (worker.exitCode === 74) root.failIndex(error)
-      root.finishIndexKind(worker.kind, output, error)
-    }
     Qt.callLater(function() { worker.destroy() })
+    if (!current) return
+
+    if (exitCode === 124) {
+      if (attempt < root.maxIndexAttempts) {
+        if (kind === "readiness") {
+          Qt.callLater(function() {
+            if (root.refreshing && session === root.indexSerial && !root.indexFailed)
+              root.startIndexWorker(kind, outputLimit, originalCommand, attempt + 1)
+          })
+          return
+        }
+        var retryQueue = root.indexQueue.slice()
+        retryQueue.unshift({ kind: kind, outputLimit: outputLimit,
+          command: originalCommand, attempt: attempt + 1 })
+        root.indexQueue = retryQueue
+        root.startNextIndexWorker()
+      } else {
+        root.failIndex("Obsidian " + kind + " command timed out after "
+          + root.maxIndexAttempts + " attempts")
+      }
+      return
+    }
+
+    var successfulOutput = exitCode === 0 ? output : ""
+    var error = exitCode === 0 ? "" : (errorOutput || "Obsidian CLI command failed")
+    if (exitCode === 2) error = "Obsidian CLI is not enabled"
+    if (exitCode === 127) error = "Obsidian CLI is not available"
+    if (exitCode === 74) {
+      root.failIndex(error)
+      return
+    }
+    if (kind === "readiness") {
+      if (exitCode !== 0) {
+        if (!root.indexBuilt && (exitCode === 2 || exitCode === 127))
+          root.finishIndexKind(kind, "", error)
+        root.failIndex(error)
+        return
+      }
+      root.finishIndexKind(kind, "", "")
+      root.startNextIndexWorker()
+      return
+    }
+    if (exitCode !== 0) {
+      root.failIndex(error)
+      return
+    }
+    root.finishIndexKind(kind, successfulOutput, error)
+    Qt.callLater(function() {
+      if (root.refreshing && session === root.indexSerial && !root.indexFailed)
+        root.startNextIndexWorker()
+    })
+  }
+
+  function abandonIndexWorker(worker) {
+    if (!worker || worker.completed) return
+    worker.completed = true
+    var session = worker.sessionSerial
+    var kind = worker.kind
+    var cancelled = worker.cancelled
+    var nextWorkers = []
+    for (var i = 0; i < root.indexWorkers.length; i++) {
+      if (root.indexWorkers[i] !== worker) nextWorkers.push(root.indexWorkers[i])
+    }
+    root.indexWorkers = nextWorkers
+    Qt.callLater(function() { worker.destroy() })
+    if (root.refreshing && !cancelled && session === root.indexSerial)
+      root.failIndex("Unable to start Obsidian CLI " + kind + " worker")
   }
 
   function finishIndexKind(kind, output, error) {
@@ -321,21 +340,13 @@ Item {
       root.errorText = ""
     } else if (!error && root.cliStatus === "unknown") {
       root.cliStatus = "available"
-    } else if (error && kind === "files") {
-      root.errorText = error
     }
 
-    if (kind === "files") {
-      root.finishFiles(output)
-    } else if (kind === "aliases") {
-      root.finishAliases(output)
-    } else if (kind === "bookmarks") {
-      root.finishBookmarks(output)
-    } else if (kind === "unresolved") {
-      root.finishUnresolved(output)
-    } else if (kind === "recents") {
-      root.finishRecents(output)
-    }
+    if (!root.refreshing || ["files", "aliases", "bookmarks", "unresolved", "recents"].indexOf(kind) < 0)
+      return
+    if (kind in root.indexOutputs) return
+    root.indexOutputs[kind] = String(output || "")
+    root.maybeBuildIndex()
   }
 
   function cleanField(value) {
@@ -355,18 +366,34 @@ Item {
     }
   }
 
+  function stopIndexProcesses() {
+    root.indexSerial += 1
+    root.refreshing = false
+    root.indexQueue = []
+    indexBuildTimer.stop()
+    root.indexBuildJob = null
+    var workers = root.indexWorkers
+    root.indexWorkers = []
+    for (var i = 0; i < workers.length; i++) {
+      var worker = workers[i]
+      if (!worker) continue
+      worker.cancelled = true
+      worker.completed = true
+      if (worker.running) worker.running = false
+      Qt.callLater((function(workerToDestroy) {
+        return function() { workerToDestroy.destroy() }
+      })(worker))
+    }
+  }
+
   function failIndex(message) {
     if (root.indexFailed) return false
+    root.stopIndexProcesses()
+    root.indexOutputs = ({})
+    if (root.indexBuilt) return false
+
     root.indexFailed = true
     root.errorText = String(message || "Vault index exceeds a supported resource limit")
-    root.filesOutput = ""
-    root.aliasesOutput = ""
-    root.bookmarksOutput = ""
-    root.unresolvedOutput = ""
-    root.recentsOutput = ""
-    root.filePaths = []
-    root.existingPathIndex = ({})
-    root.notesByPath = ({})
     root.searchItems = []
     root.exactSearchIndex = ({})
     root.fzfInput = ""
@@ -384,143 +411,6 @@ Item {
 
   function pathIndexKey(path) {
     return "$" + root.cleanField(path).trim()
-  }
-
-  function finishFiles(output) {
-    if (!root.opened || root.filesLoaded) return
-    if (root.indexFailed) {
-      root.filesLoaded = true
-      return
-    }
-    root.filesOutput = String(output || "")
-
-    var paths = []
-    var pathIndex = ({})
-    var start = 0
-    var records = 0
-    while (start < root.filesOutput.length) {
-      var end = root.filesOutput.indexOf("\n", start)
-      if (end < 0) end = root.filesOutput.length
-      var path = root.cleanField(root.filesOutput.substring(start, end).trim())
-      start = end + 1
-      records += 1
-      if (records > root.maxFiles) {
-        root.failIndex("Vault index exceeds the supported file limit (" + root.maxFiles + ")")
-        break
-      }
-      if (!root.checkField(path, root.maxPathBytes, "path")) break
-      var key = root.pathIndexKey(path)
-      if (!path || pathIndex[key]) continue
-      pathIndex[key] = true
-      paths.push(path)
-    }
-    if (root.indexFailed) {
-      root.filesLoaded = true
-      return
-    }
-    root.filesOutput = ""
-    root.filePaths = paths
-    root.existingPathIndex = pathIndex
-    root.filesLoaded = true
-    if (root.recentsLoaded) root.buildRecentModel()
-    root.maybeBuildIndex()
-  }
-
-  function finishAliases(output) {
-    if (!root.opened || root.aliasesLoaded) return
-    if (root.indexFailed) {
-      root.aliasesLoaded = true
-      return
-    }
-    root.aliasesOutput = String(output || "")
-    root.aliasesLoaded = true
-    root.maybeBuildIndex()
-  }
-
-  function finishBookmarks(output) {
-    if (!root.opened || root.bookmarksLoaded) return
-    if (root.indexFailed) {
-      root.bookmarksLoaded = true
-      return
-    }
-    root.bookmarksOutput = String(output || "")
-    root.bookmarksLoaded = true
-    root.maybeBuildIndex()
-  }
-
-  function finishUnresolved(output) {
-    if (!root.opened || root.unresolvedLoaded) return
-    if (root.indexFailed) {
-      root.unresolvedLoaded = true
-      return
-    }
-    root.unresolvedOutput = String(output || "")
-    root.unresolvedLoaded = true
-    root.maybeBuildIndex()
-  }
-
-  function finishRecents(output) {
-    if (!root.opened || root.recentsLoaded) return
-    if (root.indexFailed) {
-      root.recentsLoaded = true
-      return
-    }
-    root.recentsOutput = String(output || "")
-    root.recentsLoaded = true
-    root.buildRecentModel()
-  }
-
-  function buildRecentModel() {
-    if (!root.recentsReady || root.indexFailed) return
-
-    var rows = []
-    var seen = ({})
-    var start = 0
-    var records = 0
-    while (start < root.recentsOutput.length) {
-      var end = root.recentsOutput.indexOf("\n", start)
-      if (end < 0) end = root.recentsOutput.length
-      var path = root.cleanField(root.recentsOutput.substring(start, end).trim())
-      start = end + 1
-      records += 1
-      if (records > root.maxRecents) {
-        root.failIndex("Vault index exceeds the supported recent-file limit (" + root.maxRecents + ")")
-        return
-      }
-      if (!root.checkField(path, root.maxPathBytes, "recent path")) return
-      var pathKey = root.pathIndexKey(path)
-      if (!path || !root.existingPathIndex[pathKey] || seen[pathKey]) continue
-      seen[pathKey] = true
-
-      var title = root.titleForPath(path)
-      var aliases = ""
-      var note = root.notesByPath[pathKey]
-      if (note) {
-        title = note.title
-        aliases = note.aliases.join(" · ")
-      }
-      rows.push({
-        notePath: path,
-        noteTitle: title,
-        aliases: aliases,
-        bookmarkName: "",
-        isBookmark: false,
-        createName: "",
-        fileIcon: root.iconForPath(path)
-      })
-      if (rows.length >= 50) break
-    }
-
-    recentModel.clear()
-    for (var k = 0; k < rows.length; k++) recentModel.append(rows[k])
-
-    // Recent notes are the initial result set. Make the first row an actual
-    // keyboard selection as soon as the asynchronous batch is ready.
-    if (!root.filterText && root.activeResultModel === recentModel) {
-      root.selectedIndex = 0
-      root.cursorActive = recentModel.count > 0
-      pointerGate.reset()
-    }
   }
 
   function appendSearchItem(items, rows, item, budget) {
@@ -554,23 +444,6 @@ Item {
     if (index[key].indexOf(itemIndex) < 0) index[key].push(itemIndex)
   }
 
-  function buildExactSearchIndex(items) {
-    var index = ({})
-    for (var i = 0; i < items.length; i++) {
-      var item = items[i]
-      root.addExactSearchEntry(index, item.title, i)
-      root.addExactSearchEntry(index, item.bookmarkName, i)
-      root.addExactSearchEntry(index, item.createName, i)
-      root.addExactSearchEntry(index, item.path, i)
-      root.addExactSearchEntry(index, root.cleanField(item.path).trim().replace(/\.[^/.]+$/, ""), i)
-
-      var aliases = String(item.aliases || "").split(" · ")
-      for (var j = 0; j < aliases.length; j++)
-        root.addExactSearchEntry(index, aliases[j], i)
-    }
-    return index
-  }
-
   function exactSearchMatches(query) {
     var matches = root.exactSearchIndex[root.exactSearchKey(query)]
     return matches ? matches.slice() : []
@@ -595,180 +468,40 @@ Item {
   }
 
   function maybeBuildIndex() {
-    if (root.indexBuilt || root.indexFailed || !root.filesLoaded || !root.aliasesLoaded
-        || !root.bookmarksLoaded || !root.unresolvedLoaded) return
+    var outputs = root.indexOutputs
+    if (!root.refreshing || root.indexFailed || root.indexBuildJob
+        || typeof outputs.files !== "string" || typeof outputs.aliases !== "string"
+        || typeof outputs.bookmarks !== "string" || typeof outputs.unresolved !== "string"
+        || typeof outputs.recents !== "string") return
 
-    var byPath = ({})
-    var order = []
-    for (var i = 0; i < root.filePaths.length; i++) {
-      var path = root.filePaths[i]
-      if (!path || byPath[path]) continue
-      byPath[path] = { path: path, title: root.titleForPath(path), aliases: [] }
-      order.push(path)
+    root.indexBuildJob = IndexBuilder.createJob(root.indexSerial, outputs)
+    root.indexOutputs = ({})
+    indexBuildTimer.start()
+  }
+
+  function continueIndexBuild() {
+    var job = root.indexBuildJob
+    if (!job || !root.refreshing || job.serial !== root.indexSerial) return
+
+    if (IndexBuilder.advance(job, root, Date.now() + root.indexBuildChunkMs, 200)) {
+      root.searchItems = job.searchItems
+      root.exactSearchIndex = job.exactIndex
+      root.fzfInput = job.rows.join("\n") + (job.rows.length ? "\n" : "")
+      root.indexBuilt = true
+      root.refreshing = false
+      root.indexBuildJob = null
+      recentModel.clear()
+      for (var i = 0; i < job.recentRows.length; i++) recentModel.append(job.recentRows[i])
+      if (!root.filterText && root.activeResultModel === recentModel) {
+        root.selectedIndex = 0
+        root.cursorActive = recentModel.count > 0
+        pointerGate.reset()
+      }
+      if (root.opened && root.filterText) root.requestSearch()
+      return
     }
 
-    var aliasStart = 0
-    var aliasCount = 0
-    while (aliasStart < root.aliasesOutput.length) {
-      var aliasEnd = root.aliasesOutput.indexOf("\n", aliasStart)
-      if (aliasEnd < 0) aliasEnd = root.aliasesOutput.length
-      var line = root.aliasesOutput.substring(aliasStart, aliasEnd)
-      aliasStart = aliasEnd + 1
-      aliasCount += 1
-      if (aliasCount > root.maxAliases) {
-        root.failIndex("Vault index exceeds the supported alias limit (" + root.maxAliases + ")")
-        return
-      }
-      var tab = line.indexOf("\t")
-      if (tab < 1) continue
-      var alias = root.cleanField(line.substring(0, tab).trim())
-      var aliasPath = root.cleanField(line.substring(tab + 1).trim())
-      if (!alias || !aliasPath) continue
-      if (!root.checkField(alias, root.maxLabelBytes, "alias")
-          || !root.checkField(aliasPath, root.maxPathBytes, "alias path")) return
-      if (!byPath[aliasPath]) {
-        if (order.length >= root.maxFiles) {
-          root.failIndex("Vault index exceeds the supported indexed-path limit (" + root.maxFiles + ")")
-          return
-        }
-        byPath[aliasPath] = { path: aliasPath, title: root.titleForPath(aliasPath), aliases: [] }
-        order.push(aliasPath)
-      }
-      if (byPath[aliasPath].aliases.indexOf(alias) < 0) {
-        if (byPath[aliasPath].aliases.length >= root.maxAliasesPerFile) {
-          root.failIndex("Vault index exceeds the supported aliases-per-file limit (" + root.maxAliasesPerFile + ")")
-          return
-        }
-        byPath[aliasPath].aliases.push(alias)
-      }
-    }
-
-    var bookmarksByPath = ({})
-    var bookmarkStart = 0
-    var bookmarkCount = 0
-    while (bookmarkStart < root.bookmarksOutput.length) {
-      var bookmarkEnd = root.bookmarksOutput.indexOf("\n", bookmarkStart)
-      if (bookmarkEnd < 0) bookmarkEnd = root.bookmarksOutput.length
-      var bookmarkLine = root.bookmarksOutput.substring(bookmarkStart, bookmarkEnd)
-      bookmarkStart = bookmarkEnd + 1
-      bookmarkCount += 1
-      if (bookmarkCount > root.maxBookmarks) {
-        root.failIndex("Vault index exceeds the supported bookmark limit (" + root.maxBookmarks + ")")
-        return
-      }
-      var firstTab = bookmarkLine.indexOf("\t")
-      var secondTab = firstTab >= 0 ? bookmarkLine.indexOf("\t", firstTab + 1) : -1
-      if (firstTab < 1 || secondTab <= firstTab + 1) continue
-      var bookmarkType = bookmarkLine.substring(0, firstTab).trim()
-      if (bookmarkType !== "file") continue
-      var bookmarkPath = root.cleanField(bookmarkLine.substring(firstTab + 1, secondTab).trim())
-      var bookmarkName = root.cleanField(bookmarkLine.substring(secondTab + 1).trim())
-      if (!bookmarkPath) continue
-      if (!bookmarkName) bookmarkName = root.titleForPath(bookmarkPath)
-      if (!root.checkField(bookmarkPath, root.maxPathBytes, "bookmark path")
-          || !root.checkField(bookmarkName, root.maxLabelBytes, "bookmark name")) return
-      if (!bookmarksByPath[bookmarkPath]) bookmarksByPath[bookmarkPath] = []
-      bookmarksByPath[bookmarkPath].push({ path: bookmarkPath, name: bookmarkName })
-    }
-
-    var unresolvedItems = []
-    try {
-      var parsedUnresolved = JSON.parse(root.unresolvedOutput || "[]")
-      if (Array.isArray(parsedUnresolved)) {
-        if (parsedUnresolved.length > root.maxUnresolved) {
-          root.failIndex("Vault index exceeds the supported unresolved-link limit (" + root.maxUnresolved + ")")
-          return
-        }
-        unresolvedItems = parsedUnresolved
-      }
-    } catch (e) {
-      unresolvedItems = []
-    }
-
-    var notesByPath = ({})
-    var searchItems = []
-    var rows = []
-    var fzfBudget = { bytes: 0 }
-    for (var k = 0; k < order.length; k++) {
-      var note = byPath[order[k]]
-      notesByPath[root.pathIndexKey(note.path)] = note
-
-      if (!root.appendSearchItem(searchItems, rows, {
-        path: note.path,
-        title: note.title,
-        aliases: note.aliases.join(" · "),
-        bookmarkName: "",
-        isBookmark: false,
-        createName: "",
-        fileIcon: root.iconForPath(note.path),
-        searchText: note.aliases.join(" ")
-      }, fzfBudget)) return
-
-      var noteBookmarks = bookmarksByPath[note.path] || []
-      for (var m = 0; m < noteBookmarks.length; m++) {
-        if (!root.appendSearchItem(searchItems, rows, {
-          path: noteBookmarks[m].path,
-          title: noteBookmarks[m].name,
-          aliases: "",
-          bookmarkName: noteBookmarks[m].name,
-          isBookmark: true,
-          createName: "",
-          fileIcon: root.bookmarkIcon,
-          searchText: noteBookmarks[m].name
-        }, fzfBudget)) return
-      }
-    }
-
-    // Keep bookmarks to paths that are not present in `obsidian files`
-    // searchable as well, while retaining every bookmark as a separate row.
-    for (var bookmarkPath in bookmarksByPath) {
-      if (byPath[bookmarkPath]) continue
-      var orphanBookmarks = bookmarksByPath[bookmarkPath]
-      for (var n = 0; n < orphanBookmarks.length; n++) {
-        if (!root.appendSearchItem(searchItems, rows, {
-          path: orphanBookmarks[n].path,
-          title: orphanBookmarks[n].name,
-          aliases: "",
-          bookmarkName: orphanBookmarks[n].name,
-          isBookmark: true,
-          createName: "",
-          fileIcon: root.bookmarkIcon,
-          searchText: orphanBookmarks[n].name
-        }, fzfBudget)) return
-      }
-    }
-
-    var unresolvedSeen = ({})
-    for (var u = 0; u < unresolvedItems.length; u++) {
-      var unresolvedLink = unresolvedItems[u] && unresolvedItems[u].link
-      if (!root.checkField(unresolvedLink, root.maxPathBytes, "unresolved link")) return
-      var unresolvedName = root.createableUnresolvedName(unresolvedLink)
-      if (!unresolvedName || unresolvedSeen[unresolvedName]) continue
-      unresolvedSeen[unresolvedName] = true
-      if (!root.appendSearchItem(searchItems, rows, {
-        path: "",
-        title: unresolvedName,
-        aliases: "",
-        bookmarkName: "",
-        isBookmark: false,
-        createName: unresolvedName,
-        fileIcon: root.createIcon,
-        searchText: unresolvedName
-      }, fzfBudget)) return
-    }
-
-    root.notesByPath = notesByPath
-    root.searchItems = searchItems
-    root.exactSearchIndex = root.buildExactSearchIndex(searchItems)
-    root.fzfInput = rows.join("\n") + (rows.length ? "\n" : "")
-    root.indexBuilt = true
-    if (root.recentsLoaded) root.buildRecentModel()
-    // Release the raw command output once the compact in-memory index exists.
-    root.filesOutput = ""
-    root.aliasesOutput = ""
-    root.bookmarksOutput = ""
-    root.unresolvedOutput = ""
-    if (root.filterText) root.requestSearch()
+    if (root.indexBuildJob === job && root.refreshing) indexBuildTimer.restart()
   }
 
   function titleForPath(path) {
@@ -806,9 +539,18 @@ Item {
       root.cursorActive = recentModel.count > 0
       return
     }
-    // Keep the current batch—including recents on the first query—visible
-    // until fzf returns its complete replacement.
-    if (root.indexReady) root.requestSearch()
+    if (!root.indexReady) {
+      // Do not make an entered query look ignored while the initial index
+      // load is still in progress. maybeBuildIndex() starts this search once
+      // all sources are ready.
+      displayModel.clear()
+      root.activeResultModel = displayModel
+      root.cursorActive = false
+      return
+    }
+    // Keep the current search batch visible until fzf returns its complete
+    // replacement.
+    root.requestSearch()
   }
 
   function requestSearch() {
@@ -1030,7 +772,6 @@ Item {
     }
 
     var args = ["obsidian", "open", "path=" + row.notePath]
-    if (root.vault) args.push("vault=" + root.vault)
     root.dismiss()
     Quickshell.execDetached(args)
   }
@@ -1040,7 +781,6 @@ Item {
     if (!name) return
 
     var args = ["obsidian", "create", "name=" + name, "open"]
-    if (root.vault) args.push("vault=" + root.vault)
     root.dismiss()
     Quickshell.execDetached(args)
   }
@@ -1126,6 +866,9 @@ Item {
       id: indexWorker
       required property string kind
       required property int sessionSerial
+      required property int outputLimit
+      required property var originalCommand
+      required property int attempt
       property string output: ""
       property string errorOutput: ""
       property int exitCode: -1
@@ -1133,6 +876,8 @@ Item {
       property bool stdoutFinished: false
       property bool cancelled: false
       property bool completed: false
+      property bool started: false
+      property bool launchRequested: false
 
       stdout: StdioCollector {
         waitForEnd: true
@@ -1144,12 +889,23 @@ Item {
       }
       stderr: StdioCollector {
         waitForEnd: true
-        onStreamFinished: indexWorker.errorOutput = String(text || "").trim()
+        onStreamFinished: {
+          indexWorker.errorOutput = String(text || "").trim()
+        }
+      }
+      onStarted: {
+        indexWorker.started = true
       }
       onExited: function(code) {
         indexWorker.exitCode = code
         indexWorker.exitFinished = true
         root.maybeFinishIndexWorker(indexWorker)
+      }
+      onRunningChanged: {
+        // Quickshell does not emit exited when a process fails to start.
+        if (indexWorker.launchRequested && !indexWorker.running && !indexWorker.started
+            && !indexWorker.exitFinished && !indexWorker.completed)
+          root.abandonIndexWorker(indexWorker)
       }
     }
   }
@@ -1223,6 +979,13 @@ Item {
           root.abandonSearchWorker(worker)
       }
     }
+  }
+
+  Timer {
+    id: indexBuildTimer
+    interval: 0
+    repeat: false
+    onTriggered: root.continueIndexBuild()
   }
 
   Timer {
