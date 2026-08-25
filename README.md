@@ -34,7 +34,7 @@ When Obsidian asks you to "Set up CLI to work in the terminal," select **Skip**.
 Omarchy's default Obsidian installation uses the Electron version, so this setup
 isn't supported or needed.
 
-## Binding
+### Binding
 
 Add this to `~/.config/hypr/bindings.lua`:
 
